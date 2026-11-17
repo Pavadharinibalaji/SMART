@@ -1,45 +1,138 @@
+"""FastAPI application for SMART (Academic Intelligence Dashboard).
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+Provides endpoints for health checks, chat parsing, candidate academic information
+extraction from WhatsApp exports, SQLite persistence for academic tasks, and
+RFC 5545 iCalendar export.
+"""
+
+from __future__ import annotations
+
+from contextlib import asynccontextmanager
+from typing import Any, Optional
+
+from fastapi import FastAPI, File, HTTPException, Query, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
-from extractor import extract_academic_items
+from pydantic import BaseModel, ConfigDict, Field
 
+from calendar_export import generate_ics
+from database import (
+    ALLOWED_CATEGORIES,
+    ALLOWED_STATUSES,
+    delete_academic_item,
+    find_duplicate_item,
+    get_academic_item_by_id,
+    get_confirmed_deadline_items,
+    init_db,
+    list_academic_items,
+    save_academic_item,
+    update_academic_item_status,
+)
+from extractor import extract_academic_items
 from parser import parse_whatsapp_text
 
-app = FastAPI(title="SMART API")
+MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB upload limit
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Safely initialize database schema on application startup."""
+    init_db()
+    yield
+
+
+# Initialize schema safely on import
+init_db()
+
+app = FastAPI(
+    title="SMART API",
+    description="Academic Intelligence Dashboard backend for parsing, extracting, persisting, and exporting academic items from chat exports.",
+    version="0.2.0",
+    lifespan=lifespan,
+)
+
+
+# Allow local development frontend origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
-    allow_credentials=False,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5174",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:4173",
+        "http://127.0.0.1:4173",
+    ],
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:[0-9]+)?$",
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
+class AcademicItemCreate(BaseModel):
+    """Pydantic model validating candidate item save requests."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    title: str = Field(..., min_length=1)
+    category: str
+    description: Optional[str] = None
+    date_text: Optional[str] = None
+    due_date: Optional[str] = None
+    date_type: Optional[str] = None
+    date_status: Optional[str] = None
+    status: Optional[str] = "pending"
+    source_sender: Optional[str] = None
+    source_timestamp: Optional[str] = None
+    source_text: str = Field(..., min_length=1)
+    source_filename: Optional[str] = None
+    review_required: Optional[bool] = False
+    review_reasons: Optional[list[str]] = None
+
+
+class AcademicItemStatusUpdate(BaseModel):
+    """Pydantic model validating task status updates."""
+
+    status: str = Field(..., min_length=1)
+
+
 @app.get("/api/health")
 def health_check():
+    """Health check endpoint to verify backend service status."""
     return {
         "status": "healthy",
         "project": "SMART",
+        "version": "0.2.0",
         "message": "SMART backend is running",
     }
 
 
-@app.post("/api/upload-chat")
-async def upload_chat(file: UploadFile = File(...)):
+async def _read_and_validate_file(file: UploadFile) -> str:
+    """Validate uploaded file type, size, encoding, and non-emptiness.
+
+    Returns the decoded UTF-8 string.
+    """
     if not file.filename or not file.filename.lower().endswith(".txt"):
         raise HTTPException(
             status_code=400,
             detail="Please upload a WhatsApp .txt export.",
         )
 
-    # Limit this demo to 5 MB per upload.
-    content = await file.read(5 * 1024 * 1024 + 1)
+    # Read up to MAX_FILE_SIZE + 1 bytes to detect oversized files
+    content = await file.read(MAX_FILE_SIZE + 1)
 
-    if len(content) > 5 * 1024 * 1024:
+    if len(content) > MAX_FILE_SIZE:
         raise HTTPException(
             status_code=413,
             detail="File is too large. Maximum size is 5 MB.",
+        )
+
+    if len(content) == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="The uploaded file is empty.",
         )
 
     try:
@@ -50,12 +143,25 @@ async def upload_chat(file: UploadFile = File(...)):
             detail="Could not decode this file as UTF-8 text.",
         )
 
+    if not raw_text.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="The uploaded file is empty.",
+        )
+
+    return raw_text
+
+
+@app.post("/api/upload-chat")
+async def upload_chat(file: UploadFile = File(...)):
+    """Parse a WhatsApp .txt export and return structured messages."""
+    raw_text = await _read_and_validate_file(file)
     messages = parse_whatsapp_text(raw_text)
 
     if not messages:
         raise HTTPException(
             status_code=422,
-            detail="No recognised WhatsApp messages were found.",
+            detail="No recognised WhatsApp messages were found. Please check that the export matches supported WhatsApp formats.",
         )
 
     return {
@@ -65,45 +171,204 @@ async def upload_chat(file: UploadFile = File(...)):
     }
 
 
-
 @app.post("/api/extract-academic")
 async def extract_academic(file: UploadFile = File(...)):
-    if not file.filename or not file.filename.lower().endswith(".txt"):
-        raise HTTPException(
-            status_code=400,
-            detail="Please upload a WhatsApp .txt export.",
-        )
-
-    content = await file.read(5 * 1024 * 1024 + 1)
-
-    if len(content) > 5 * 1024 * 1024:
-        raise HTTPException(
-            status_code=413,
-            detail="File is too large. Maximum size is 5 MB.",
-        )
-
-    try:
-        raw_text = content.decode("utf-8-sig")
-    except UnicodeDecodeError:
-        raise HTTPException(
-            status_code=400,
-            detail="Could not decode this file as UTF-8 text.",
-        )
-
+    """Parse a WhatsApp export and extract candidate academic items."""
+    raw_text = await _read_and_validate_file(file)
     messages = parse_whatsapp_text(raw_text)
 
     if not messages:
         raise HTTPException(
             status_code=422,
-            detail="No recognised WhatsApp messages were found.",
+            detail="No recognised WhatsApp messages were found. Please check that the export matches supported WhatsApp formats.",
         )
 
     items = extract_academic_items(messages)
+
+    category_counts: dict[str, int] = {}
+    review_count = 0
+    for item in items:
+        cat = item.get("category", "Uncategorized")
+        category_counts[cat] = category_counts.get(cat, 0) + 1
+        if item.get("review_required"):
+            review_count += 1
 
     return {
         "filename": file.filename,
         "total_messages": len(messages),
         "total_items": len(items),
+        "review_required_count": review_count,
+        "category_counts": category_counts,
         "items": items,
+    }
+
+
+# ==============================================================================
+# Phase 2 Endpoints: Persistence & Academic Task Management
+# ==============================================================================
+
+
+@app.post("/api/academic-items", status_code=status.HTTP_201_CREATED)
+def create_academic_item(item: AcademicItemCreate) -> dict[str, Any]:
+    """Validate and persist an extracted candidate academic item.
+
+    Deduplicates based on source provenance to avoid accidental re-saves.
+    """
+    clean_cat = item.category.strip()
+    if clean_cat not in ALLOWED_CATEGORIES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid category '{item.category}'. Allowed categories: {', '.join(sorted(ALLOWED_CATEGORIES))}",
+        )
+
+    clean_status = (item.status or "pending").strip().lower()
+    if clean_status not in ALLOWED_STATUSES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid status '{item.status}'. Allowed statuses: {', '.join(sorted(ALLOWED_STATUSES))}",
+        )
+
+    # Deduplication check
+    existing = find_duplicate_item(
+        source_text=item.source_text,
+        source_timestamp=item.source_timestamp,
+        source_sender=item.source_sender,
+        category=clean_cat,
+        source_filename=item.source_filename,
+    )
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Academic item has already been saved (Task #{existing['id']}).",
+        )
+
+    payload = item.model_dump()
+    try:
+        saved = save_academic_item(payload)
+        return saved
+    except ValueError as err:
+        raise HTTPException(status_code=400, detail=str(err))
+    except Exception as err:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to persist academic item: {err}",
+        )
+
+
+@app.get("/api/academic-items")
+def get_academic_items(
+    category: Optional[str] = Query(None, description="Filter by category"),
+    status_filter: Optional[str] = Query(
+        None, alias="status", description="Filter by status"
+    ),
+    search: Optional[str] = Query(
+        None, description="Search in title or description or original message"
+    ),
+    due_before: Optional[str] = Query(
+        None, description="Filter items due on or before date (YYYY-MM-DD)"
+    ),
+    due_after: Optional[str] = Query(
+        None, description="Filter items due on or after date (YYYY-MM-DD)"
+    ),
+) -> list[dict[str, Any]]:
+    """List and filter saved academic items with deterministic ordering."""
+    try:
+        items = list_academic_items(
+            category=category,
+            status=status_filter,
+            search=search,
+            due_before=due_before,
+            due_after=due_after,
+        )
+        return items
+    except ValueError as err:
+        raise HTTPException(status_code=400, detail=str(err))
+    except Exception as err:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to query academic items: {err}",
+        )
+
+
+def _export_ics_response() -> Response:
+    """Helper generating .ics response for confirmed deadlines."""
+    items = get_confirmed_deadline_items()
+    if not items:
+        raise HTTPException(
+            status_code=404,
+            detail="No confirmed deadlines available to export.",
+        )
+
+    ics_content = generate_ics(items)
+    return Response(
+        content=ics_content,
+        media_type="text/calendar; charset=utf-8",
+        headers={
+            "Content-Disposition": 'attachment; filename="smart_academic_deadlines.ics"'
+        },
+    )
+
+
+@app.get("/api/academic-items/export-ics")
+def export_deadlines_ics() -> Response:
+    """Export all confirmed academic deadlines as an RFC 5545 .ics calendar."""
+    return _export_ics_response()
+
+
+@app.get("/api/academic-items/export.ics")
+def export_deadlines_ics_alias() -> Response:
+    """Alias endpoint for direct .ics download."""
+    return _export_ics_response()
+
+
+@app.get("/api/academic-items/{item_id}")
+def get_single_academic_item(item_id: int) -> dict[str, Any]:
+    """Retrieve a single academic item by ID."""
+    item = get_academic_item_by_id(item_id)
+    if not item:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Academic item with ID {item_id} not found.",
+        )
+    return item
+
+
+@app.patch("/api/academic-items/{item_id}")
+def update_task_status(
+    item_id: int, update: AcademicItemStatusUpdate
+) -> dict[str, Any]:
+    """Update task status (pending, completed, dismissed)."""
+    clean_status = update.status.strip().lower()
+    if clean_status not in ALLOWED_STATUSES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid status '{update.status}'. Allowed statuses: {', '.join(sorted(ALLOWED_STATUSES))}",
+        )
+
+    try:
+        updated = update_academic_item_status(item_id, clean_status)
+    except ValueError as err:
+        raise HTTPException(status_code=400, detail=str(err))
+
+    if not updated:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Academic item with ID {item_id} not found.",
+        )
+    return updated
+
+
+@app.delete("/api/academic-items/{item_id}")
+def delete_task_item(item_id: int) -> dict[str, Any]:
+    """Delete a saved academic item record."""
+    deleted = delete_academic_item(item_id)
+    if not deleted:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Academic item with ID {item_id} not found.",
+        )
+    return {
+        "message": f"Academic item with ID {item_id} deleted successfully.",
+        "id": item_id,
     }
 
