@@ -530,3 +530,394 @@ def test_icalendar_text_escaping():
     # Continuation lines start with space
     for line in lines[1:]:
         assert line.startswith(" ")
+
+
+# ==============================================================================
+# Phase 1: Academic Task Editing Tests
+# ==============================================================================
+
+# 15. Update task title
+def test_update_task_title():
+    create_res = client.post(
+        "/api/academic-items",
+        json={
+            "title": "Initial Title",
+            "category": "Assignment",
+            "source_text": "Original message text",
+            "due_date": "2026-11-01",
+        },
+    )
+    item_id = create_res.json()["id"]
+    initial_updated_at = create_res.json()["updated_at"]
+
+    patch_res = client.patch(
+        f"/api/academic-items/{item_id}",
+        json={"title": "Updated Task Title"},
+    )
+    assert patch_res.status_code == 200
+    data = patch_res.json()
+    assert data["title"] == "Updated Task Title"
+    assert data["category"] == "Assignment"
+    assert data["due_date"] == "2026-11-01"
+    assert data["updated_at"] >= initial_updated_at
+
+
+# 16. Update task description
+def test_update_task_description():
+    create_res = client.post(
+        "/api/academic-items",
+        json={
+            "title": "Task for Description Update",
+            "category": "Exam",
+            "description": "Old short description",
+            "source_text": "Exam text",
+        },
+    )
+    item_id = create_res.json()["id"]
+
+    patch_res = client.patch(
+        f"/api/academic-items/{item_id}",
+        json={"description": "Comprehensive instructions: Bring calculator and ID card."},
+    )
+    assert patch_res.status_code == 200
+    assert patch_res.json()["description"] == "Comprehensive instructions: Bring calculator and ID card."
+    assert patch_res.json()["title"] == "Task for Description Update"
+
+
+# 17. Update task category
+def test_update_task_category():
+    create_res = client.post(
+        "/api/academic-items",
+        json={
+            "title": "Misclassified Item",
+            "category": "Announcement",
+            "source_text": "Workshop text",
+        },
+    )
+    item_id = create_res.json()["id"]
+
+    patch_res = client.patch(
+        f"/api/academic-items/{item_id}",
+        json={"category": "Event"},
+    )
+    assert patch_res.status_code == 200
+    assert patch_res.json()["category"] == "Event"
+
+
+# 18. Update task due date
+def test_update_task_due_date():
+    create_res = client.post(
+        "/api/academic-items",
+        json={
+            "title": "Date Update Task",
+            "category": "Assignment",
+            "source_text": "Assignment text",
+            "due_date": "2026-11-01",
+        },
+    )
+    item_id = create_res.json()["id"]
+
+    patch_res = client.patch(
+        f"/api/academic-items/{item_id}",
+        json={"due_date": "2026-11-15"},
+    )
+    assert patch_res.status_code == 200
+    assert patch_res.json()["due_date"] == "2026-11-15"
+
+
+# 19. Partial update preserving unsupplied fields
+def test_partial_update_preserves_other_fields():
+    create_res = client.post(
+        "/api/academic-items",
+        json={
+            "title": "Preserve Fields Task",
+            "category": "Assignment",
+            "description": "Important project description",
+            "due_date": "2026-11-20",
+            "date_text": "Nov 20",
+            "date_type": "deadline",
+            "status": "pending",
+            "source_sender": "Prof. Miller",
+            "source_timestamp": "2026-10-15 10:00",
+            "source_text": "Original verbatim chat message",
+            "source_filename": "chat_export.txt",
+        },
+    )
+    item_id = create_res.json()["id"]
+
+    patch_res = client.patch(
+        f"/api/academic-items/{item_id}",
+        json={"title": "Renamed Title Only"},
+    )
+    assert patch_res.status_code == 200
+    data = patch_res.json()
+    assert data["title"] == "Renamed Title Only"
+    assert data["category"] == "Assignment"
+    assert data["description"] == "Important project description"
+    assert data["due_date"] == "2026-11-20"
+    assert data["date_text"] == "Nov 20"
+    assert data["date_type"] == "deadline"
+    assert data["status"] == "pending"
+    assert data["source_sender"] == "Prof. Miller"
+    assert data["source_timestamp"] == "2026-10-15 10:00"
+    assert data["source_text"] == "Original verbatim chat message"
+    assert data["source_filename"] == "chat_export.txt"
+
+
+# 20. Multiple fields updated together
+def test_multiple_fields_updated_together():
+    create_res = client.post(
+        "/api/academic-items",
+        json={
+            "title": "Multi Update Task",
+            "category": "Announcement",
+            "description": "Initial text",
+            "due_date": "2026-11-05",
+            "status": "pending",
+            "source_text": "Some text",
+        },
+    )
+    item_id = create_res.json()["id"]
+
+    patch_res = client.patch(
+        f"/api/academic-items/{item_id}",
+        json={
+            "title": "Software Engineering Hackathon",
+            "category": "Opportunity",
+            "description": "Register teams of 4 on the portal",
+            "due_date": "2026-12-01",
+            "date_type": "deadline",
+            "status": "completed",
+        },
+    )
+    assert patch_res.status_code == 200
+    data = patch_res.json()
+    assert data["title"] == "Software Engineering Hackathon"
+    assert data["category"] == "Opportunity"
+    assert data["description"] == "Register teams of 4 on the portal"
+    assert data["due_date"] == "2026-12-01"
+    assert data["date_type"] == "deadline"
+    assert data["status"] == "completed"
+
+
+# 21. Explicit null handling
+def test_update_explicit_null_handling():
+    create_res = client.post(
+        "/api/academic-items",
+        json={
+            "title": "Task with Date to Clear",
+            "category": "Assignment",
+            "due_date": "2026-11-10",
+            "date_text": "10th Nov",
+            "description": "Has description",
+            "source_text": "Assignment text",
+        },
+    )
+    item_id = create_res.json()["id"]
+
+    # Explicit null due_date clears the due_date
+    patch_res = client.patch(
+        f"/api/academic-items/{item_id}",
+        json={"due_date": None},
+    )
+    assert patch_res.status_code == 200
+    data = patch_res.json()
+    assert data["due_date"] is None
+    assert data["title"] == "Task with Date to Clear"
+    assert data["category"] == "Assignment"
+
+    # Explicit null description clears to empty string
+    patch_desc = client.patch(
+        f"/api/academic-items/{item_id}",
+        json={"description": None},
+    )
+    assert patch_desc.status_code == 200
+    assert patch_desc.json()["description"] == ""
+
+
+# 22. Invalid category rejected with 422
+def test_update_invalid_category_rejected():
+    create_res = client.post(
+        "/api/academic-items",
+        json={
+            "title": "Category Validation Test",
+            "category": "Assignment",
+            "source_text": "Test text",
+        },
+    )
+    item_id = create_res.json()["id"]
+
+    patch_res = client.patch(
+        f"/api/academic-items/{item_id}",
+        json={"category": "NonexistentCategory"},
+    )
+    assert patch_res.status_code == 422
+
+
+# 23. Invalid date rejected with 422
+def test_update_invalid_date_rejected():
+    create_res = client.post(
+        "/api/academic-items",
+        json={
+            "title": "Date Validation Test",
+            "category": "Assignment",
+            "source_text": "Test text",
+        },
+    )
+    item_id = create_res.json()["id"]
+
+    # Non-date string
+    patch_bad_str = client.patch(
+        f"/api/academic-items/{item_id}",
+        json={"due_date": "not-a-real-date"},
+    )
+    assert patch_bad_str.status_code == 422
+
+    # Non-ISO format (DD/MM/YYYY)
+    patch_non_iso = client.patch(
+        f"/api/academic-items/{item_id}",
+        json={"due_date": "25/11/2026"},
+    )
+    assert patch_non_iso.status_code == 422
+
+
+# 24. Nonexistent task ID returns 404
+def test_update_nonexistent_task_id_returns_404():
+    patch_res = client.patch(
+        "/api/academic-items/999999",
+        json={"title": "Ghost Task"},
+    )
+    assert patch_res.status_code == 404
+    assert "not found" in patch_res.json()["detail"].lower()
+
+
+# 25. Immutable provenance fields cannot be modified (rejected with 422)
+def test_immutable_provenance_fields_cannot_be_modified():
+    create_res = client.post(
+        "/api/academic-items",
+        json={
+            "title": "Provenance Security Test",
+            "category": "Assignment",
+            "source_sender": "Authentic Sender",
+            "source_timestamp": "2026-10-20 09:00",
+            "source_text": "Original unaltered text",
+            "source_filename": "authentic.txt",
+        },
+    )
+    item_id = create_res.json()["id"]
+
+    # Attempt to tamper with source_text
+    res_text = client.patch(
+        f"/api/academic-items/{item_id}",
+        json={"source_text": "Tampered source text"},
+    )
+    assert res_text.status_code == 422
+
+    # Attempt to tamper with source_sender
+    res_sender = client.patch(
+        f"/api/academic-items/{item_id}",
+        json={"source_sender": "Malicious Impersonator"},
+    )
+    assert res_sender.status_code == 422
+
+    # Attempt to tamper with source_timestamp
+    res_ts = client.patch(
+        f"/api/academic-items/{item_id}",
+        json={"source_timestamp": "1999-01-01 00:00"},
+    )
+    assert res_ts.status_code == 422
+
+    # Attempt to tamper with source_filename
+    res_fn = client.patch(
+        f"/api/academic-items/{item_id}",
+        json={"source_filename": "fake.txt"},
+    )
+    assert res_fn.status_code == 422
+
+    # Attempt to tamper with created_at
+    res_created = client.patch(
+        f"/api/academic-items/{item_id}",
+        json={"created_at": "2000-01-01T00:00:00"},
+    )
+    assert res_created.status_code == 422
+
+    # Attempt to tamper with id
+    res_id = client.patch(
+        f"/api/academic-items/{item_id}",
+        json={"id": 9999},
+    )
+    assert res_id.status_code == 422
+
+    # Verify original record remained completely unmodified
+    item_res = client.get(f"/api/academic-items/{item_id}")
+    assert item_res.status_code == 200
+    record = item_res.json()
+    assert record["source_sender"] == "Authentic Sender"
+    assert record["source_timestamp"] == "2026-10-20 09:00"
+    assert record["source_text"] == "Original unaltered text"
+    assert record["source_filename"] == "authentic.txt"
+
+
+# 26. Existing task creation and deduplication remain unaffected
+def test_existing_creation_and_deduplication_unaffected():
+    payload = {
+        "title": "Deduplication Verification",
+        "category": "Exam",
+        "source_sender": "Coordinator",
+        "source_timestamp": "2026-10-22 14:00",
+        "source_text": "Semester Midterm exam is on 2026-11-25.",
+        "source_filename": "exam_schedule.txt",
+        "due_date": "2026-11-25",
+        "date_type": "deadline",
+    }
+
+    # Task creation succeeds
+    create_res = client.post("/api/academic-items", json=payload)
+    assert create_res.status_code == 201
+    item_id = create_res.json()["id"]
+
+    # Update title
+    patch_res = client.patch(
+        f"/api/academic-items/{item_id}",
+        json={"title": "Midterm Exam - Distributed Systems"},
+    )
+    assert patch_res.status_code == 200
+    assert patch_res.json()["title"] == "Midterm Exam - Distributed Systems"
+
+    # Duplicate creation with identical source provenance still rejected with 409
+    dup_res = client.post("/api/academic-items", json=payload)
+    assert dup_res.status_code == 409
+    assert str(item_id) in dup_res.json()["detail"]
+
+
+# 27. Database layer update method direct unit tests
+def test_database_update_academic_item_direct():
+    from database import get_academic_item_by_id, save_academic_item, update_academic_item
+
+    created = save_academic_item({
+        "title": "Direct DB Test",
+        "category": "Assignment",
+        "source_text": "Direct DB source text",
+        "due_date": "2026-11-01",
+    })
+    item_id = created["id"]
+
+    # Safe partial update
+    updated = update_academic_item(item_id, {"title": "Direct DB Updated", "due_date": "2026-11-10"})
+    assert updated is not None
+    assert updated["title"] == "Direct DB Updated"
+    assert updated["due_date"] == "2026-11-10"
+    assert updated["source_text"] == "Direct DB source text"
+
+    # Nonexistent ID returns None
+    assert update_academic_item(999999, {"title": "Ghost"}) is None
+    assert update_academic_item(-1, {"title": "Negative"}) is None
+
+    # Immutable fields raise ValueError at DB level
+    with pytest.raises(ValueError, match="immutable provenance data"):
+        update_academic_item(item_id, {"source_text": "Changed"})
+
+    # Empty update returns existing item
+    same = update_academic_item(item_id, {})
+    assert same is not None
+    assert same["title"] == "Direct DB Updated"

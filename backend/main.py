@@ -12,7 +12,7 @@ from typing import Any, Optional
 
 from fastapi import FastAPI, File, HTTPException, Query, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from calendar_export import generate_ics
 from database import (
@@ -23,8 +23,10 @@ from database import (
     get_academic_item_by_id,
     get_confirmed_deadline_items,
     init_db,
+    is_valid_iso_date,
     list_academic_items,
     save_academic_item,
+    update_academic_item,
     update_academic_item_status,
 )
 from extractor import extract_academic_items
@@ -92,10 +94,61 @@ class AcademicItemCreate(BaseModel):
     review_reasons: Optional[list[str]] = None
 
 
-class AcademicItemStatusUpdate(BaseModel):
-    """Pydantic model validating task status updates."""
+class AcademicItemUpdate(BaseModel):
+    """Pydantic model validating partial updates to an academic item."""
 
-    status: str = Field(..., min_length=1)
+    model_config = ConfigDict(extra="forbid")
+
+    title: Optional[str] = None
+    category: Optional[str] = None
+    description: Optional[str] = None
+    date_text: Optional[str] = None
+    due_date: Optional[str] = None
+    date_type: Optional[str] = None
+    date_status: Optional[str] = None
+    status: Optional[str] = None
+    review_required: Optional[bool] = None
+    review_reasons: Optional[list[str]] = None
+
+    @field_validator("title")
+    @classmethod
+    def validate_title(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            raise ValueError("Item title cannot be null.")
+        clean = v.strip()
+        if not clean:
+            raise ValueError("Item title cannot be empty.")
+        return clean
+
+    @field_validator("category")
+    @classmethod
+    def validate_category(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            raise ValueError("Item category cannot be null.")
+        clean = v.strip()
+        if clean not in ALLOWED_CATEGORIES:
+            raise ValueError(
+                f"Invalid category '{v}'. Allowed categories: {', '.join(sorted(ALLOWED_CATEGORIES))}"
+            )
+        return clean
+
+    @field_validator("due_date")
+    @classmethod
+    def validate_due_date(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        clean = v.strip()
+        if not clean:
+            return None
+        if not is_valid_iso_date(clean):
+            raise ValueError(
+                f"Invalid due_date format '{v}'. Expected YYYY-MM-DD."
+            )
+        return clean
+
+
+# Backward compatibility alias
+AcademicItemStatusUpdate = AcademicItemUpdate
 
 
 @app.get("/api/health")
@@ -334,21 +387,45 @@ def get_single_academic_item(item_id: int) -> dict[str, Any]:
 
 
 @app.patch("/api/academic-items/{item_id}")
-def update_task_status(
-    item_id: int, update: AcademicItemStatusUpdate
+def update_task_item(
+    item_id: int, update: AcademicItemUpdate
 ) -> dict[str, Any]:
-    """Update task status (pending, completed, dismissed)."""
-    clean_status = update.status.strip().lower()
-    if clean_status not in ALLOWED_STATUSES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid status '{update.status}'. Allowed statuses: {', '.join(sorted(ALLOWED_STATUSES))}",
-        )
+    """Partially update an academic item's editable fields or status."""
+    # Check if empty payload was sent
+    if not update.model_fields_set:
+        item = get_academic_item_by_id(item_id)
+        if not item:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Academic item with ID {item_id} not found.",
+            )
+        return item
+
+    # Backward compatibility: preserve existing 400 Bad Request behavior for invalid status
+    if "status" in update.model_fields_set:
+        if update.status is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid status. Status cannot be null.",
+            )
+        clean_status = update.status.strip().lower()
+        if clean_status not in ALLOWED_STATUSES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid status '{update.status}'. Allowed statuses: {', '.join(sorted(ALLOWED_STATUSES))}",
+            )
+
+    payload = update.model_dump(exclude_unset=True)
 
     try:
-        updated = update_academic_item_status(item_id, clean_status)
+        updated = update_academic_item(item_id, payload)
     except ValueError as err:
         raise HTTPException(status_code=400, detail=str(err))
+    except Exception:
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to update academic item.",
+        )
 
     if not updated:
         raise HTTPException(
@@ -356,6 +433,10 @@ def update_task_status(
             detail=f"Academic item with ID {item_id} not found.",
         )
     return updated
+
+
+# Backward compatibility function alias
+update_task_status = update_task_item
 
 
 @app.delete("/api/academic-items/{item_id}")

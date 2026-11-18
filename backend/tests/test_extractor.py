@@ -6,8 +6,10 @@ from extractor import (
     classify_message,
     detect_date,
     extract_academic_items,
+    extract_time,
     extract_urls,
     parse_message_date,
+    resolve_weekday,
 )
 
 
@@ -172,3 +174,311 @@ def test_source_evidence_preservation():
     assert item["source_timestamp"] == "19/10/2026, 11:30 am"
     assert item["source_text"] == "Quiz 1 is scheduled for 25/10/2026 in Room 301."
     assert item["extraction_method"] == "rules"
+
+
+# ==============================================================================
+# Phase 2: Enhanced Parsing and Extraction Intelligence Tests
+# ==============================================================================
+
+# Group A: Multi-item extraction
+# 1. Assignment and examination in one message
+def test_multi_item_assignment_and_examination_in_one_message():
+    messages = [
+        {
+            "message_id": 1,
+            "timestamp_text": "19/10/2026, 9:00 am",
+            "sender": "Coordinator",
+            "text": "DBMS assignment submission is Friday. CN internal exam is Monday.",
+        }
+    ]
+    items = extract_academic_items(messages)
+    assert len(items) == 2
+    assert items[0]["category"] == "Assignment"
+    assert "DBMS assignment" in items[0]["title"]
+    assert items[0]["due_date"] == "2026-10-23"
+    assert items[0]["source_message_id"] == 1
+    assert items[0]["source_text"] == messages[0]["text"]
+
+    assert items[1]["category"] == "Exam"
+    assert "CN internal exam" in items[1]["title"]
+    assert items[1]["due_date"] == "2026-10-26"
+    assert items[1]["source_message_id"] == 1
+    assert items[1]["source_text"] == messages[0]["text"]
+
+
+# 2. Assignment, examination, and event in one message
+def test_multi_item_assignment_examination_and_event_in_one_message():
+    messages = [
+        {
+            "message_id": 2,
+            "timestamp_text": "19/10/2026, 9:00 am",
+            "sender": "Coordinator",
+            "text": "DBMS assignment submission is Friday. CN internal exam is Monday. Register for the AI workshop before Wednesday.",
+        }
+    ]
+    items = extract_academic_items(messages)
+    assert len(items) == 3
+    categories = [i["category"] for i in items]
+    assert "Assignment" in categories
+    assert "Exam" in categories
+    assert any(c in ("Event", "Opportunity") for c in categories)
+
+
+# 3. Registration deadline and event date in one message
+def test_multi_item_registration_deadline_and_event_date_in_one_message():
+    messages = [
+        {
+            "message_id": 3,
+            "timestamp_text": "19/10/2026, 9:00 am",
+            "sender": "Workshop Chair",
+            "text": "Workshop registration closes on Wednesday. The workshop will be held on Saturday.",
+        }
+    ]
+    items = extract_academic_items(messages)
+    assert len(items) == 2
+    reg_item = next(i for i in items if i["date_type"] == "deadline")
+    assert reg_item["due_date"] == "2026-10-21"  # Wednesday
+    event_item = next(i for i in items if i["date_type"] == "event_date")
+    assert event_item["due_date"] == "2026-10-24"  # Saturday
+
+
+# 4. Single-task message still works
+def test_single_task_message_still_works():
+    messages = [
+        {
+            "message_id": 4,
+            "timestamp_text": "19/10/2026, 9:00 am",
+            "sender": "Teacher",
+            "text": "Assignment 1 on Distributed Systems is due on 28/10/2026.",
+        }
+    ]
+    items = extract_academic_items(messages)
+    assert len(items) == 1
+    assert items[0]["category"] == "Assignment"
+    assert items[0]["due_date"] == "2026-10-28"
+
+
+# 5. No duplicate candidates for multiline single task
+def test_no_duplicate_candidates_for_multiline_task():
+    messages = [
+        {
+            "message_id": 5,
+            "timestamp_text": "19/10/2026, 9:00 am",
+            "sender": "Teacher",
+            "text": "Assignment 1 is released.\nThe deadline is 28/10/2026.\nSubmit code on portal.",
+        }
+    ]
+    items = extract_academic_items(messages)
+    assert len(items) == 1
+    assert items[0]["category"] == "Assignment"
+    assert items[0]["due_date"] == "2026-10-28"
+
+
+# Group B: Multiple dates
+# 6. Two explicit dates associated with two tasks
+def test_two_explicit_dates_associated_with_two_tasks():
+    messages = [
+        {
+            "message_id": 6,
+            "timestamp_text": "19/10/2026, 9:00 am",
+            "sender": "Dept Rep",
+            "text": "Assignment submission is due on 20 November 2026. The internal examination is on 25 November 2026.",
+        }
+    ]
+    items = extract_academic_items(messages)
+    assert len(items) == 2
+    assignment_item = next(i for i in items if i["category"] == "Assignment")
+    exam_item = next(i for i in items if i["category"] == "Exam")
+    assert assignment_item["due_date"] == "2026-11-20"
+    assert exam_item["due_date"] == "2026-11-25"
+
+
+# 7. Two relative weekdays associated with two tasks
+def test_two_relative_weekdays_associated_with_two_tasks():
+    messages = [
+        {
+            "message_id": 7,
+            "timestamp_text": "19/10/2026, 9:00 am",  # Monday
+            "sender": "Dept Rep",
+            "text": "DBMS assignment is due on Friday. Operating Systems quiz is on Monday.",
+        }
+    ]
+    items = extract_academic_items(messages)
+    assert len(items) == 2
+    assert items[0]["due_date"] == "2026-10-23"  # Friday
+    assert items[1]["due_date"] == "2026-10-26"  # Monday
+
+
+# 8. Multiple dates in one sentence with ambiguous association
+def test_multiple_dates_in_one_sentence_ambiguous_association():
+    messages = [
+        {
+            "message_id": 8,
+            "timestamp_text": "19/10/2026, 9:00 am",
+            "sender": "Teacher",
+            "text": "The project demo will be held on either 10/11/2026 or 12/11/2026.",
+        }
+    ]
+    items = extract_academic_items(messages)
+    assert len(items) == 1
+    assert items[0]["review_required"] is True
+    assert items[0]["date_status"] == "needs_review"
+    assert items[0]["due_date"] is None
+    assert any("Multiple candidate dates" in r for r in items[0]["review_reasons"])
+
+
+# 9. Date association does not leak across unrelated tasks
+def test_date_association_does_not_leak_across_tasks():
+    messages = [
+        {
+            "message_id": 9,
+            "timestamp_text": "19/10/2026, 9:00 am",  # Monday
+            "sender": "Admin",
+            "text": "Assignment 1 is due on 28/10/2026. Important Notice: holiday declared tomorrow for all students.",
+        }
+    ]
+    items = extract_academic_items(messages)
+    assert len(items) == 2
+    assign_item = next(i for i in items if i["category"] == "Assignment")
+    notice_item = next(i for i in items if i["category"] == "Announcement")
+    assert assign_item["due_date"] == "2026-10-28"
+    assert notice_item["due_date"] == "2026-10-20"  # tomorrow
+
+
+# Group C: Deadline times
+# 10. 11:59 PM
+def test_extract_time_1159_pm():
+    res = extract_time("Submit the assignment by 11:59 PM on Friday.")
+    assert res["time_text"] == "11:59 PM"
+    assert res["deadline_time"] == "23:59"
+
+
+# 11. 9:30 AM
+def test_extract_time_930_am():
+    res = extract_time("Internal examination starts at 9:30 AM on Monday.")
+    assert res["time_text"] == "9:30 AM"
+    assert res["deadline_time"] == "09:30"
+
+
+# 12. 24-hour time
+def test_extract_time_24_hour():
+    res1 = extract_time("Submit report before 14:30 on Friday.")
+    assert res1["time_text"] == "14:30"
+    assert res1["deadline_time"] == "14:30"
+
+    res2 = extract_time("Project portal closes at 23:59.")
+    assert res2["time_text"] == "23:59"
+    assert res2["deadline_time"] == "23:59"
+
+
+# 13. Time without minutes
+def test_extract_time_without_minutes():
+    res_pm = extract_time("Guest lecture at 5 PM on Tuesday.")
+    assert res_pm["time_text"] == "5 PM"
+    assert res_pm["deadline_time"] == "17:00"
+
+    res_am = extract_time("Meeting starts at 9 AM.")
+    assert res_am["time_text"] == "9 AM"
+    assert res_am["deadline_time"] == "09:00"
+
+
+# 14. Missing time remains missing
+def test_missing_time_remains_missing():
+    res = extract_time("Assignment is due on Friday.")
+    assert res["time_text"] is None
+    assert res["deadline_time"] is None
+
+
+# Group D: Relative weekdays
+# 15. Tomorrow
+def test_relative_weekday_tomorrow():
+    res = detect_date("Assignment is due tomorrow!", "19/10/2026, 10:00 am")
+    assert res["date_status"] == "resolved_from_message_date"
+    assert res["due_date"] == "2026-10-20"
+
+
+# 16. Day after tomorrow
+def test_relative_weekday_day_after_tomorrow():
+    res = detect_date("Project submission is day after tomorrow.", "19/10/2026, 10:00 am")
+    assert res["date_status"] == "resolved_from_message_date"
+    assert res["due_date"] == "2026-10-21"
+
+
+# 17. Bare weekday
+def test_relative_bare_weekday():
+    # Message sent on Monday 19/10/2026
+    timestamp = "19/10/2026, 9:00 am"
+    res_fri = detect_date("Assignment is due Friday.", timestamp)
+    assert res_fri["due_date"] == "2026-10-23"
+
+    res_mon = detect_date("Next lecture on Monday.", timestamp)
+    assert res_mon["due_date"] == "2026-10-26"
+
+
+# 18. Next Monday
+def test_relative_next_weekday():
+    # Message sent on Monday 19/10/2026
+    timestamp = "19/10/2026, 9:00 am"
+    res_next_mon = detect_date("Midterm exam is next Monday.", timestamp)
+    assert res_next_mon["due_date"] == "2026-10-26"
+
+    # Next Friday from Monday is in the following week (+11 days)
+    res_next_fri = detect_date("Project due next Friday.", timestamp)
+    assert res_next_fri["due_date"] == "2026-10-30"
+
+
+# 19. Message timestamp unavailable
+def test_relative_weekday_timestamp_unavailable():
+    res = detect_date("Assignment is due Friday.", "")
+    assert res["due_date"] is None
+    assert res["date_status"] == "needs_review"
+
+
+# 20. Weekday at a year boundary
+def test_relative_weekday_year_boundary():
+    # Wednesday, December 30, 2026
+    timestamp = "30/12/2026, 10:00 am"
+    res_fri = detect_date("Lab record due Friday.", timestamp)
+    assert res_fri["due_date"] == "2027-01-01"
+
+    res_next_mon = detect_date("Exam scheduled for next Monday.", timestamp)
+    assert res_next_mon["due_date"] == "2027-01-04"
+
+
+# Group E: International dates
+# 21. DD/MM/YYYY
+def test_international_date_slash():
+    res = detect_date("Final submission is 28/10/2026.", "19/10/2026, 9:00 am")
+    assert res["due_date"] == "2026-10-28"
+    assert res["date_status"] == "parsed"
+
+
+# 22. DD-MM-YYYY
+def test_international_date_hyphen():
+    res = detect_date("Final submission is 28-10-2026.", "19/10/2026, 9:00 am")
+    assert res["due_date"] == "2026-10-28"
+    assert res["date_status"] == "parsed"
+
+
+# 23. DD.MM.YYYY
+def test_international_date_dot():
+    res = detect_date("Final submission is 28.10.2026.", "19/10/2026, 9:00 am")
+    assert res["due_date"] == "2026-10-28"
+    assert res["date_status"] == "parsed"
+
+
+# 24. Textual month formats
+def test_textual_month_formats():
+    res1 = detect_date("Workshop on 15 November 2026.", "19/10/2026, 9:00 am")
+    assert res1["due_date"] == "2026-11-15"
+
+    res2 = detect_date("Final paper due on December 5, 2026.", "19/10/2026, 9:00 am")
+    assert res2["due_date"] == "2026-12-05"
+
+
+# 25. Ambiguous numeric date remains flagged
+def test_ambiguous_numeric_date_remains_flagged():
+    res = detect_date("Meeting on 05/06/2026.", "19/10/2026, 9:00 am")
+    assert res["due_date"] is None
+    assert res["date_status"] == "needs_review"
+    assert "ambiguous" in res["date_reasons"][0].lower()

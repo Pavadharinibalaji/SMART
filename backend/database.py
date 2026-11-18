@@ -19,6 +19,28 @@ DEFAULT_DB_PATH = DEFAULT_DATA_DIR / "smart.db"
 ALLOWED_CATEGORIES = {"Assignment", "Exam", "Announcement", "Event", "Opportunity"}
 ALLOWED_STATUSES = {"pending", "completed", "dismissed"}
 
+IMMUTABLE_FIELDS = {
+    "id",
+    "source_text",
+    "source_sender",
+    "source_timestamp",
+    "source_filename",
+    "created_at",
+}
+
+EDITABLE_COLUMNS = {
+    "title",
+    "category",
+    "description",
+    "date_text",
+    "due_date",
+    "date_type",
+    "date_status",
+    "status",
+    "review_required",
+    "review_reasons",
+}
+
 
 def get_db_path() -> Path:
     """Return the active database path from environment or default location."""
@@ -362,6 +384,142 @@ def list_academic_items(
         return [row_to_item_dict(r) for r in rows]
 
 
+def update_academic_item(
+    item_id: int,
+    updates: dict[str, Any],
+    db_path: Optional[Path | str] = None,
+) -> Optional[dict[str, Any]]:
+    """Safely update an existing academic item's editable fields.
+
+    Parameters:
+    - item_id: primary key ID of the task to update.
+    - updates: dictionary of column names to new values.
+    - db_path: optional database path override.
+
+    Requirements enforced:
+    - Only supplied editable fields are modified; unsupplied fields remain untouched.
+    - Explicit None is supported for nullable fields (e.g. clearing due_date).
+    - Immutable provenance fields (source_text, source_sender, source_timestamp,
+      source_filename, created_at, id) are rejected with ValueError.
+    - Automatically updates updated_at to the current UTC ISO timestamp.
+    - Uses parameterized SQL queries to prevent SQL injection.
+    - Returns None if item_id does not exist.
+    """
+    if not isinstance(item_id, int) or item_id <= 0:
+        return None
+
+    # Check for immutable provenance fields
+    for field in updates:
+        if field in IMMUTABLE_FIELDS:
+            raise ValueError(
+                f"Field '{field}' is immutable provenance data and cannot be modified."
+            )
+
+    # Validate that all update keys are known editable columns
+    for field in updates:
+        if field not in EDITABLE_COLUMNS:
+            raise ValueError(f"Unknown or uneditable field '{field}'.")
+
+    # If updates is empty, verify item exists and return it
+    if not updates:
+        return get_academic_item_by_id(item_id, db_path=db_path)
+
+    processed: dict[str, Any] = {}
+
+    if "title" in updates:
+        val = updates["title"]
+        if val is None or not str(val).strip():
+            raise ValueError("Item title cannot be null or empty.")
+        processed["title"] = str(val).strip()
+
+    if "category" in updates:
+        val = updates["category"]
+        if val is None:
+            raise ValueError("Item category cannot be null.")
+        clean_cat = str(val).strip()
+        if clean_cat not in ALLOWED_CATEGORIES:
+            raise ValueError(
+                f"Invalid category '{clean_cat}'. Allowed categories: {', '.join(sorted(ALLOWED_CATEGORIES))}"
+            )
+        processed["category"] = clean_cat
+
+    if "status" in updates:
+        val = updates["status"]
+        if val is None:
+            raise ValueError("Item status cannot be null.")
+        clean_status = str(val).strip().lower()
+        if clean_status not in ALLOWED_STATUSES:
+            raise ValueError(
+                f"Invalid status '{clean_status}'. Allowed statuses: {', '.join(sorted(ALLOWED_STATUSES))}"
+            )
+        processed["status"] = clean_status
+
+    if "due_date" in updates:
+        val = updates["due_date"]
+        if val is not None:
+            clean_date = str(val).strip()
+            if not clean_date:
+                processed["due_date"] = None
+            elif not is_valid_iso_date(clean_date):
+                raise ValueError(
+                    f"Invalid due_date format '{clean_date}'. Expected YYYY-MM-DD."
+                )
+            else:
+                processed["due_date"] = clean_date
+        else:
+            processed["due_date"] = None
+
+    if "description" in updates:
+        val = updates["description"]
+        processed["description"] = str(val).strip() if val is not None else ""
+
+    if "date_text" in updates:
+        val = updates["date_text"]
+        processed["date_text"] = str(val).strip() if val is not None else None
+
+    if "date_type" in updates:
+        val = updates["date_type"]
+        processed["date_type"] = str(val).strip() if val is not None else "unknown"
+
+    if "date_status" in updates:
+        val = updates["date_status"]
+        processed["date_status"] = str(val).strip() if val is not None else "not_found"
+
+    if "review_required" in updates:
+        val = updates["review_required"]
+        processed["review_required"] = 1 if val else 0
+
+    if "review_reasons" in updates:
+        val = updates["review_reasons"]
+        if val is None:
+            processed["review_reasons"] = "[]"
+        elif isinstance(val, str):
+            processed["review_reasons"] = json.dumps([val])
+        else:
+            processed["review_reasons"] = json.dumps(list(val))
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    processed["updated_at"] = now_iso
+
+    set_clauses = [f"{col} = ?" for col in processed]
+    params = list(processed.values())
+    params.append(item_id)
+
+    update_sql = f"""
+        UPDATE academic_items
+        SET {', '.join(set_clauses)}
+        WHERE id = ?;
+    """
+
+    with get_db_connection(db_path) as conn:
+        cursor = conn.execute(update_sql, tuple(params))
+        conn.commit()
+        if cursor.rowcount == 0:
+            return None
+
+    return get_academic_item_by_id(item_id, db_path=db_path)
+
+
 def update_academic_item_status(
     item_id: int,
     new_status: str,
@@ -374,20 +532,7 @@ def update_academic_item_status(
             f"Invalid status '{new_status}'. Allowed statuses: {', '.join(sorted(ALLOWED_STATUSES))}"
         )
 
-    now_iso = datetime.now(timezone.utc).isoformat()
-    update_sql = """
-        UPDATE academic_items
-        SET status = ?, updated_at = ?
-        WHERE id = ?;
-    """
-
-    with get_db_connection(db_path) as conn:
-        cursor = conn.execute(update_sql, (clean_status, now_iso, item_id))
-        conn.commit()
-        if cursor.rowcount == 0:
-            return None
-
-    return get_academic_item_by_id(item_id, db_path=db_path)
+    return update_academic_item(item_id, {"status": clean_status}, db_path=db_path)
 
 
 def delete_academic_item(
