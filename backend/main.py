@@ -17,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from calendar_export import generate_ics
 from database import (
     ALLOWED_CATEGORIES,
+    ALLOWED_CONFIDENCE_LEVELS,
     ALLOWED_STATUSES,
     delete_academic_item,
     find_duplicate_item,
@@ -74,7 +75,15 @@ app.add_middleware(
 
 
 class AcademicItemCreate(BaseModel):
-    """Pydantic model validating candidate item save requests."""
+    """Pydantic model validating candidate item save requests.
+
+    confidence and confidence_reasons are system-generated fields.
+    Client-supplied values are silently ignored; manually created tasks receive
+    UNASSESSED confidence to distinguish them from pipeline-extracted candidates.
+
+    evidence_text, when provided, must be a substring of source_text. The backend
+    extraction pipeline uses _trusted_evidence to bypass this check safely.
+    """
 
     model_config = ConfigDict(extra="ignore")
 
@@ -90,12 +99,24 @@ class AcademicItemCreate(BaseModel):
     source_timestamp: Optional[str] = None
     source_text: str = Field(..., min_length=1)
     source_filename: Optional[str] = None
+    # evidence_text is accepted from clients but validated as a substring of source_text.
+    # Arbitrary fabricated evidence is rejected by save_academic_item.
+    evidence_text: Optional[str] = None
+    # NOTE: confidence and confidence_reasons are intentionally excluded from this schema.
+    # Client-supplied confidence assertions are not trusted. The persistence layer assigns
+    # UNASSESSED to all manually created items. Only the extraction pipeline may supply
+    # a calculated confidence score via _trusted_confidence.
     review_required: Optional[bool] = False
     review_reasons: Optional[list[str]] = None
 
 
 class AcademicItemUpdate(BaseModel):
-    """Pydantic model validating partial updates to an academic item."""
+    """Pydantic model validating partial updates to an academic item.
+
+    confidence and confidence_reasons are system-generated immutable fields.
+    They are intentionally excluded from this schema; any PATCH request supplying
+    them will be rejected with HTTP 422 (extra_forbidden).
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -109,6 +130,7 @@ class AcademicItemUpdate(BaseModel):
     status: Optional[str] = None
     review_required: Optional[bool] = None
     review_reasons: Optional[list[str]] = None
+    # confidence and confidence_reasons are deliberately absent — they are immutable.
 
     @field_validator("title")
     @classmethod
@@ -239,10 +261,13 @@ async def extract_academic(file: UploadFile = File(...)):
     items = extract_academic_items(messages)
 
     category_counts: dict[str, int] = {}
+    confidence_counts: dict[str, int] = {"HIGH": 0, "MEDIUM": 0, "LOW": 0, "UNASSESSED": 0}
     review_count = 0
     for item in items:
         cat = item.get("category", "Uncategorized")
         category_counts[cat] = category_counts.get(cat, 0) + 1
+        conf = item.get("confidence", "UNASSESSED")
+        confidence_counts[conf] = confidence_counts.get(conf, 0) + 1
         if item.get("review_required"):
             review_count += 1
 
@@ -252,6 +277,7 @@ async def extract_academic(file: UploadFile = File(...)):
         "total_items": len(items),
         "review_required_count": review_count,
         "category_counts": category_counts,
+        "confidence_counts": confidence_counts,
         "items": items,
     }
 
@@ -259,6 +285,26 @@ async def extract_academic(file: UploadFile = File(...)):
 # ==============================================================================
 # Phase 2 Endpoints: Persistence & Academic Task Management
 # ==============================================================================
+
+
+def _build_trusted_extraction_payload(candidate: dict[str, Any]) -> dict[str, Any]:
+    """Convert an extraction pipeline candidate into a trusted save payload.
+
+    Injects the _trusted_confidence and _trusted_evidence sentinel keys so that
+    save_academic_item() persists the pipeline-calculated confidence without
+    treating it as a client-supplied (and therefore untrusted) value.
+
+    This is the ONLY internal path that should write system-generated confidence
+    into the database; all other callers receive UNASSESSED.
+    """
+    payload = dict(candidate)
+    # Move pipeline confidence to trusted sentinel keys
+    payload["_trusted_confidence"] = candidate.get("confidence", "UNASSESSED")
+    payload["_trusted_confidence_reasons"] = candidate.get("confidence_reasons") or []
+    # Mark evidence as pipeline-sourced (bypasses substring validation since
+    # extract_academic_items guarantees evidence_text is derived from source_text)
+    payload["_trusted_evidence"] = True
+    return payload
 
 
 @app.post("/api/academic-items", status_code=status.HTTP_201_CREATED)
@@ -296,6 +342,10 @@ def create_academic_item(item: AcademicItemCreate) -> dict[str, Any]:
         )
 
     payload = item.model_dump()
+    # NOTE: confidence and confidence_reasons are NOT present on AcademicItemCreate.
+    # Manually created items are persisted as UNASSESSED by save_academic_item().
+    # The extraction pipeline saves items via _save_extraction_candidate() which
+    # injects _trusted_confidence and _trusted_evidence into the payload.
     try:
         saved = save_academic_item(payload)
         return saved
@@ -323,6 +373,9 @@ def get_academic_items(
     due_after: Optional[str] = Query(
         None, description="Filter items due on or after date (YYYY-MM-DD)"
     ),
+    confidence: Optional[str] = Query(
+        None, description="Filter items by confidence level ('HIGH', 'MEDIUM', 'LOW', 'UNASSESSED')"
+    ),
 ) -> list[dict[str, Any]]:
     """List and filter saved academic items with deterministic ordering."""
     try:
@@ -332,6 +385,7 @@ def get_academic_items(
             search=search,
             due_before=due_before,
             due_after=due_after,
+            confidence=confidence,
         )
         return items
     except ValueError as err:

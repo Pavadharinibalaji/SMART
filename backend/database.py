@@ -18,13 +18,20 @@ DEFAULT_DB_PATH = DEFAULT_DATA_DIR / "smart.db"
 
 ALLOWED_CATEGORIES = {"Assignment", "Exam", "Announcement", "Event", "Opportunity"}
 ALLOWED_STATUSES = {"pending", "completed", "dismissed"}
+# UNASSESSED: legacy rows pre-Phase3 or manually created tasks without a calculated score.
+ALLOWED_CONFIDENCE_LEVELS = {"HIGH", "MEDIUM", "LOW", "UNASSESSED"}
 
+# Confidence and confidence_reasons are system-generated algorithmic facts reflecting
+# extraction fidelity. They must never be modified by API clients after persistence.
 IMMUTABLE_FIELDS = {
     "id",
     "source_text",
     "source_sender",
     "source_timestamp",
     "source_filename",
+    "evidence_text",
+    "confidence",
+    "confidence_reasons",
     "created_at",
 }
 
@@ -76,7 +83,7 @@ def get_db_connection(db_path: Optional[Path | str] = None) -> sqlite3.Connectio
 
 
 def init_db(db_path: Optional[Path | str] = None) -> None:
-    """Safely initialize the academic items schema and indexes."""
+    """Safely initialize the academic items schema and apply additive migrations."""
     resolved_path = Path(db_path) if db_path else get_db_path()
     resolved_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -99,11 +106,29 @@ def init_db(db_path: Optional[Path | str] = None) -> None:
                 source_filename TEXT,
                 review_required INTEGER NOT NULL DEFAULT 0,
                 review_reasons TEXT,
+                evidence_text TEXT,
+                confidence TEXT DEFAULT 'MEDIUM',
+                confidence_reasons TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
             """
         )
+
+        # Additive migration: check existing columns and add missing ones
+        cursor = conn.execute("PRAGMA table_info(academic_items);")
+        existing_cols = {row["name"] for row in cursor.fetchall()}
+
+        if "evidence_text" not in existing_cols:
+            conn.execute("ALTER TABLE academic_items ADD COLUMN evidence_text TEXT;")
+
+        if "confidence" not in existing_cols:
+            conn.execute(
+                "ALTER TABLE academic_items ADD COLUMN confidence TEXT DEFAULT 'MEDIUM';"
+            )
+
+        if "confidence_reasons" not in existing_cols:
+            conn.execute("ALTER TABLE academic_items ADD COLUMN confidence_reasons TEXT;")
 
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_academic_items_category ON academic_items(category);"
@@ -115,6 +140,9 @@ def init_db(db_path: Optional[Path | str] = None) -> None:
             "CREATE INDEX IF NOT EXISTS idx_academic_items_due_date ON academic_items(due_date);"
         )
         conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_academic_items_confidence ON academic_items(confidence);"
+        )
+        conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_academic_items_dedup ON academic_items(source_text, source_timestamp, source_sender, category);"
         )
         conn.commit()
@@ -122,7 +150,9 @@ def init_db(db_path: Optional[Path | str] = None) -> None:
 
 def row_to_item_dict(row: sqlite3.Row) -> dict[str, Any]:
     """Convert an academic_items sqlite3.Row to a clean dictionary."""
-    reasons_raw = row["review_reasons"]
+    row_keys = row.keys()
+
+    reasons_raw = row["review_reasons"] if "review_reasons" in row_keys else None
     reasons: list[str] = []
     if reasons_raw:
         try:
@@ -131,6 +161,22 @@ def row_to_item_dict(row: sqlite3.Row) -> dict[str, Any]:
                 reasons = [str(reasons)]
         except (json.JSONDecodeError, TypeError):
             reasons = [reasons_raw]
+
+    conf_reasons_raw = row["confidence_reasons"] if "confidence_reasons" in row_keys else None
+    conf_reasons: list[str] = []
+    if conf_reasons_raw:
+        try:
+            conf_reasons = json.loads(conf_reasons_raw)
+            if not isinstance(conf_reasons, list):
+                conf_reasons = [str(conf_reasons)]
+        except (json.JSONDecodeError, TypeError):
+            conf_reasons = [conf_reasons_raw]
+
+    # Legacy rows (pre-Phase3) with NULL confidence are represented as UNASSESSED rather
+    # than silently promoted to MEDIUM, which would misrepresent unscored records.
+    confidence = row["confidence"] if ("confidence" in row_keys and row["confidence"]) else "UNASSESSED"
+    # Legacy rows without evidence_text remain None — not backfilled from source_text.
+    evidence_text = row["evidence_text"] if ("evidence_text" in row_keys and row["evidence_text"]) else None
 
     return {
         "id": row["id"],
@@ -146,6 +192,9 @@ def row_to_item_dict(row: sqlite3.Row) -> dict[str, Any]:
         "source_timestamp": row["source_timestamp"] or "",
         "source_text": row["source_text"],
         "source_filename": row["source_filename"] or "",
+        "evidence_text": evidence_text,
+        "confidence": confidence,
+        "confidence_reasons": conf_reasons,
         "review_required": bool(row["review_required"]),
         "review_reasons": reasons,
         "created_at": row["created_at"],
@@ -251,14 +300,50 @@ def save_academic_item(
     else:
         review_reasons_str = json.dumps(list(review_reasons))
 
+    # evidence_text: only trusted when sourced from the backend extraction pipeline.
+    # The trusted path uses the _trusted_evidence sentinel key.
+    # Client-supplied evidence_text via POST is accepted only when it matches source_text
+    # exactly, preventing injection of fabricated extraction evidence.
+    raw_evidence = data.get("evidence_text")
+    if raw_evidence:
+        raw_evidence = str(raw_evidence).strip()
+        # Validate substring membership only when this is a client-supplied POST (not pipeline).
+        if not data.get("_trusted_evidence") and raw_evidence not in source_text:
+            raise ValueError(
+                "evidence_text must be a substring of source_text. "
+                "Fabricated extraction evidence is not permitted."
+            )
+        evidence_text: str | None = raw_evidence
+    else:
+        evidence_text = None
+
+    # confidence and confidence_reasons: system-generated fields.
+    # Extraction pipeline passes _trusted_confidence to store its calculated score.
+    # Manual/client-created tasks receive UNASSESSED to distinguish them from scored records.
+    trusted_conf = data.get("_trusted_confidence")
+    if trusted_conf:
+        confidence = str(trusted_conf).strip().upper()
+        if confidence not in ALLOWED_CONFIDENCE_LEVELS:
+            confidence = "UNASSESSED"
+    else:
+        # Manual task creation: ignore client-supplied confidence; mark as UNASSESSED.
+        confidence = "UNASSESSED"
+
+    trusted_conf_reasons = data.get("_trusted_confidence_reasons") or []
+    if isinstance(trusted_conf_reasons, str):
+        conf_reasons_str = json.dumps([trusted_conf_reasons])
+    else:
+        conf_reasons_str = json.dumps(list(trusted_conf_reasons))
+
     now_iso = datetime.now(timezone.utc).isoformat()
 
     insert_sql = """
         INSERT INTO academic_items (
             title, category, description, date_text, due_date, date_type,
             date_status, status, source_sender, source_timestamp, source_text,
-            source_filename, review_required, review_reasons, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            source_filename, evidence_text, confidence, confidence_reasons,
+            review_required, review_reasons, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
     """
 
     with get_db_connection(db_path) as conn:
@@ -277,6 +362,9 @@ def save_academic_item(
                 source_timestamp,
                 source_text,
                 source_filename,
+                evidence_text,
+                confidence,
+                conf_reasons_str,
                 review_required,
                 review_reasons_str,
                 now_iso,
@@ -312,6 +400,7 @@ def list_academic_items(
     search: Optional[str] = None,
     due_before: Optional[str] = None,
     due_after: Optional[str] = None,
+    confidence: Optional[str] = None,
     db_path: Optional[Path | str] = None,
 ) -> list[dict[str, Any]]:
     """Query and filter academic items with deterministic ordering.
@@ -339,6 +428,19 @@ def list_academic_items(
             )
         conditions.append("status = ?")
         params.append(status_clean)
+
+    if confidence:
+        confidence_clean = confidence.strip().upper()
+        if confidence_clean not in ALLOWED_CONFIDENCE_LEVELS:
+            raise ValueError(
+                f"Invalid confidence '{confidence}'. Allowed levels: {', '.join(sorted(ALLOWED_CONFIDENCE_LEVELS))}"
+            )
+        # UNASSESSED rows may be stored as NULL (legacy) or as the literal 'UNASSESSED' string.
+        if confidence_clean == "UNASSESSED":
+            conditions.append("(confidence IS NULL OR confidence = 'UNASSESSED')")
+        else:
+            conditions.append("confidence = ?")
+            params.append(confidence_clean)
 
     if search:
         search_pattern = f"%{search.strip()}%"
@@ -497,6 +599,10 @@ def update_academic_item(
             processed["review_reasons"] = json.dumps([val])
         else:
             processed["review_reasons"] = json.dumps(list(val))
+
+    # confidence and confidence_reasons are now IMMUTABLE_FIELDS.
+    # The IMMUTABLE_FIELDS check at the top of this function already rejects them with ValueError.
+    # No processing branch is needed here.
 
     now_iso = datetime.now(timezone.utc).isoformat()
     processed["updated_at"] = now_iso

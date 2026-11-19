@@ -7,6 +7,7 @@
     "dev": "vite",
     "build": "vite build",
     "lint": "eslint .",
+    "test": "node src/utils/highlightEvidence.test.mjs && node src/components/ReviewIndicator.test.mjs && node src/utils/confidenceFilter.test.mjs && node src/utils/integrationE2E.test.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

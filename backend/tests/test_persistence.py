@@ -921,3 +921,566 @@ def test_database_update_academic_item_direct():
     same = update_academic_item(item_id, {})
     assert same is not None
     assert same["title"] == "Direct DB Updated"
+
+
+# ==============================================================================
+# Phase 3: Confidence Scoring & Evidence Intelligence Persistence Tests
+# ==============================================================================
+
+
+# 28. Persistence of trusted pipeline confidence and evidence metadata
+def test_persistence_confidence_and_evidence_metadata(tmp_path):
+    """Confidence and evidence_text are persisted correctly when supplied via the
+    trusted extraction-pipeline path (_trusted_confidence / _trusted_evidence)."""
+    from database import get_academic_item_by_id, save_academic_item
+
+    custom_db = tmp_path / "metadata_test.db"
+    init_db(custom_db)
+
+    # Simulate the extraction pipeline using trusted sentinel keys
+    payload = {
+        "title": "Machine Learning Lab 1",
+        "category": "Assignment",
+        "due_date": "2026-11-15",
+        "date_type": "deadline",
+        "date_status": "parsed",
+        "source_text": "Machine Learning Lab 1 is due on 15/11/2026. Submit code on portal.",
+        "evidence_text": "Machine Learning Lab 1 is due on 15/11/2026.",
+        # Trusted pipeline path: sentinel keys bypass client-trust restriction
+        "_trusted_confidence": "HIGH",
+        "_trusted_confidence_reasons": ["Unambiguous academic category with validated explicit calendar date."],
+        "_trusted_evidence": True,
+    }
+
+    saved = save_academic_item(payload, db_path=custom_db)
+    assert saved["id"] is not None
+    assert saved["confidence"] == "HIGH"
+    assert saved["confidence_reasons"] == ["Unambiguous academic category with validated explicit calendar date."]
+    assert saved["evidence_text"] == "Machine Learning Lab 1 is due on 15/11/2026."
+
+    retrieved = get_academic_item_by_id(saved["id"], db_path=custom_db)
+    assert retrieved is not None
+    assert retrieved["confidence"] == "HIGH"
+    assert retrieved["confidence_reasons"] == ["Unambiguous academic category with validated explicit calendar date."]
+    assert retrieved["evidence_text"] == "Machine Learning Lab 1 is due on 15/11/2026."
+
+    # Via REST API (manual POST): confidence is UNASSESSED, evidence must be substring of source_text
+    api_res = client.post(
+        "/api/academic-items",
+        json={
+            "title": "API ML Lab",
+            "category": "Assignment",
+            "source_text": "API ML Lab is due on 15/11/2026.",
+            # evidence_text is a substring of source_text: allowed
+            "evidence_text": "API ML Lab is due on 15/11/2026.",
+            # NOTE: confidence and confidence_reasons are silently ignored by the API
+        },
+    )
+    assert api_res.status_code == 201
+    created = api_res.json()
+    # Manual POST receives UNASSESSED — not client-supplied confidence
+    assert created["confidence"] == "UNASSESSED"
+    # evidence_text is preserved (it is a valid substring of source_text)
+    assert created["evidence_text"] == "API ML Lab is due on 15/11/2026."
+
+
+# 29. Legacy database records without confidence metadata
+def test_persistence_legacy_records_without_confidence(tmp_path):
+    from database import get_academic_item_by_id
+
+    custom_db = tmp_path / "legacy_test.db"
+    init_db(custom_db)
+
+    # Insert a legacy row using raw SQL with NULL for new Phase 3 columns
+    with get_db_connection(custom_db) as conn:
+        conn.execute(
+            """
+            INSERT INTO academic_items (
+                title, category, source_text, confidence, confidence_reasons, evidence_text, created_at, updated_at
+            ) VALUES (?, ?, ?, NULL, NULL, NULL, ?, ?);
+            """,
+            ("Legacy Item", "Assignment", "Legacy source text", "2026-11-18T00:00:00", "2026-11-18T00:00:00"),
+        )
+        cursor = conn.execute("SELECT last_insert_rowid();")
+        legacy_id = cursor.fetchone()[0]
+        conn.commit()
+
+    retrieved = get_academic_item_by_id(legacy_id, db_path=custom_db)
+    assert retrieved is not None
+    assert retrieved["title"] == "Legacy Item"
+    # Phase 3.1 correction: legacy NULL confidence is UNASSESSED, not falsely promoted to MEDIUM
+    assert retrieved["confidence"] == "UNASSESSED"
+    assert retrieved["confidence_reasons"] == []
+    # Legacy NULL evidence_text remains None — not backfilled from source_text
+    assert retrieved["evidence_text"] is None
+
+
+# 30. Database migration idempotency
+def test_database_migration_idempotency(tmp_path):
+    from database import get_academic_item_by_id, save_academic_item
+
+    custom_db = tmp_path / "idempotency_test.db"
+
+    # Call init_db multiple times
+    init_db(custom_db)
+    init_db(custom_db)
+    init_db(custom_db)
+
+    # Save an item via the trusted pipeline path
+    saved = save_academic_item({
+        "title": "Idempotent Task",
+        "category": "Exam",
+        "source_text": "Idempotent source text",
+        "_trusted_confidence": "HIGH",
+        "_trusted_confidence_reasons": [],
+    }, db_path=custom_db)
+
+    # Call init_db again after data exists
+    init_db(custom_db)
+    init_db(custom_db)
+
+    # Verify data is undisturbed
+    retrieved = get_academic_item_by_id(saved["id"], db_path=custom_db)
+    assert retrieved is not None
+    assert retrieved["title"] == "Idempotent Task"
+    assert retrieved["confidence"] == "HIGH"
+
+
+# 31. Immutable evidence text cannot be modified
+def test_immutable_evidence_text_cannot_be_modified():
+    from database import get_academic_item_by_id, update_academic_item
+
+    create_res = client.post(
+        "/api/academic-items",
+        json={
+            "title": "Evidence Test Task",
+            "category": "Assignment",
+            "source_text": "Original message text with authentic evidence.",
+            # evidence_text is a valid substring of source_text
+            "evidence_text": "authentic evidence",
+        },
+    )
+    assert create_res.status_code == 201
+    item_id = create_res.json()["id"]
+
+    # Attempt to tamper with evidence_text via PATCH endpoint -> HTTP 422 extra_forbidden
+    patch_res = client.patch(
+        f"/api/academic-items/{item_id}",
+        json={"evidence_text": "Fabricated evidence"},
+    )
+    assert patch_res.status_code == 422
+    assert "extra_forbidden" in patch_res.text
+
+    # Attempt to tamper via direct DB update -> ValueError
+    with pytest.raises(ValueError, match="immutable provenance data"):
+        update_academic_item(item_id, {"evidence_text": "Fabricated evidence"})
+
+    # Verify DB still has authentic evidence
+    db_item = get_academic_item_by_id(item_id)
+    assert db_item is not None
+    assert db_item["evidence_text"] == "authentic evidence"
+
+
+# 32. Filtering items by confidence (including UNASSESSED)
+def test_filter_items_by_confidence():
+    # Manual items receive UNASSESSED automatically
+    client.post(
+        "/api/academic-items",
+        json={
+            "title": "Unassessed Task",
+            "category": "Assignment",
+            "source_text": "Unassessed conf source text",
+        },
+    )
+
+    # Filter UNASSESSED — retrieves manually created tasks
+    res_unassessed = client.get("/api/academic-items?confidence=UNASSESSED")
+    assert res_unassessed.status_code == 200
+    for it in res_unassessed.json():
+        assert it["confidence"] == "UNASSESSED"
+
+    # Invalid confidence filter -> HTTP 400
+    res_bad = client.get("/api/academic-items?confidence=UNKNOWN")
+    assert res_bad.status_code == 400
+    assert "Invalid confidence" in res_bad.json()["detail"]
+
+
+# ==============================================================================
+# Phase 3.1: Integrity Corrections — New Regression Tests
+# ==============================================================================
+
+
+# 33. PATCH cannot modify confidence
+def test_patch_cannot_modify_confidence():
+    """confidence is an immutable system-generated field; PATCH with confidence must return 422."""
+    create_res = client.post(
+        "/api/academic-items",
+        json={
+            "title": "Confidence Lock Test",
+            "category": "Assignment",
+            "source_text": "Confidence lock test source text.",
+        },
+    )
+    assert create_res.status_code == 201
+    item_id = create_res.json()["id"]
+
+    patch_res = client.patch(
+        f"/api/academic-items/{item_id}",
+        json={"confidence": "HIGH"},
+    )
+    # AcademicItemUpdate forbids confidence (extra="forbid") -> HTTP 422
+    assert patch_res.status_code == 422
+
+
+# 34. PATCH cannot modify confidence_reasons
+def test_patch_cannot_modify_confidence_reasons():
+    """confidence_reasons is an immutable system-generated field; PATCH must return 422."""
+    create_res = client.post(
+        "/api/academic-items",
+        json={
+            "title": "Confidence Reasons Lock Test",
+            "category": "Exam",
+            "source_text": "Confidence reasons lock test source text.",
+        },
+    )
+    assert create_res.status_code == 201
+    item_id = create_res.json()["id"]
+
+    patch_res = client.patch(
+        f"/api/academic-items/{item_id}",
+        json={"confidence_reasons": ["Injected reason"]},
+    )
+    assert patch_res.status_code == 422
+
+
+# 35. POST cannot inject arbitrary machine confidence
+def test_post_cannot_inject_arbitrary_confidence():
+    """REST POST silently ignores client-supplied confidence; manually created items are UNASSESSED."""
+    res = client.post(
+        "/api/academic-items",
+        json={
+            "title": "Injected Confidence Task",
+            "category": "Assignment",
+            "source_text": "Injected confidence test source text.",
+            # Client attempts to supply an arbitrary confidence — should be ignored
+            "confidence": "HIGH",
+            "confidence_reasons": ["I am definitely accurate"],
+        },
+    )
+    assert res.status_code == 201
+    created = res.json()
+    # Confidence must be UNASSESSED regardless of what the client supplied
+    assert created["confidence"] == "UNASSESSED"
+    # confidence_reasons not present on the schema, so they are silently discarded
+
+
+# 36. POST cannot inject fabricated extraction evidence
+def test_post_cannot_inject_fabricated_evidence():
+    """evidence_text that is not a substring of source_text must be rejected."""
+    res = client.post(
+        "/api/academic-items",
+        json={
+            "title": "Fabricated Evidence Task",
+            "category": "Assignment",
+            "source_text": "Actual message text without evidence.",
+            # This evidence does NOT appear in source_text -> should be rejected
+            "evidence_text": "Completely fabricated extraction evidence",
+        },
+    )
+    # HTTP 400: evidence_text must be a substring of source_text
+    assert res.status_code == 400
+    assert "fabricated" in res.json()["detail"].lower() or "substring" in res.json()["detail"].lower()
+
+
+# 37. Trusted pipeline evidence is persisted correctly
+def test_trusted_extraction_evidence_persists_correctly(tmp_path):
+    """The extraction pipeline can persist confidence and evidence via trusted sentinel keys."""
+    from database import get_academic_item_by_id, save_academic_item
+
+    custom_db = tmp_path / "trusted_test.db"
+    init_db(custom_db)
+
+    source = "CN assignment is due on 25/11/2026. Please submit before midnight."
+    evidence = "CN assignment is due on 25/11/2026."
+
+    saved = save_academic_item({
+        "title": "CN Assignment",
+        "category": "Assignment",
+        "source_text": source,
+        "evidence_text": evidence,
+        "_trusted_confidence": "HIGH",
+        "_trusted_confidence_reasons": ["Unambiguous academic category with validated explicit calendar date."],
+        "_trusted_evidence": True,
+    }, db_path=custom_db)
+
+    assert saved["confidence"] == "HIGH"
+    assert saved["evidence_text"] == evidence
+    retrieved = get_academic_item_by_id(saved["id"], db_path=custom_db)
+    assert retrieved["evidence_text"] == evidence
+    assert retrieved["confidence"] == "HIGH"
+
+
+# 38. Manual task creation is correctly represented as UNASSESSED
+def test_manual_task_creation_is_unassessed():
+    """Manually created tasks via POST have UNASSESSED confidence and no fabricated evidence."""
+    res = client.post(
+        "/api/academic-items",
+        json={
+            "title": "Manual Task Entry",
+            "category": "Announcement",
+            "source_text": "Student posted this manually without WhatsApp extraction.",
+        },
+    )
+    assert res.status_code == 201
+    item = res.json()
+    assert item["confidence"] == "UNASSESSED"
+    # evidence_text was not supplied; should be None
+    assert item["evidence_text"] is None
+
+
+# 39. Legacy NULL confidence is represented as UNASSESSED (not MEDIUM)
+def test_legacy_null_confidence_is_unassessed(tmp_path):
+    """Legacy rows with NULL confidence must be surfaced as UNASSESSED, not MEDIUM."""
+    from database import get_academic_item_by_id
+
+    custom_db = tmp_path / "legacy_unassessed.db"
+    init_db(custom_db)
+
+    with get_db_connection(custom_db) as conn:
+        conn.execute(
+            """
+            INSERT INTO academic_items (
+                title, category, source_text, confidence, confidence_reasons,
+                evidence_text, created_at, updated_at
+            ) VALUES (?, ?, ?, NULL, NULL, NULL, ?, ?);
+            """,
+            ("Pre-Phase3 Item", "Exam", "Exam on Monday morning.", "2026-01-01T00:00:00", "2026-01-01T00:00:00"),
+        )
+        cursor = conn.execute("SELECT last_insert_rowid();")
+        legacy_id = cursor.fetchone()[0]
+        conn.commit()
+
+    item = get_academic_item_by_id(legacy_id, db_path=custom_db)
+    assert item is not None
+    assert item["confidence"] == "UNASSESSED"
+    assert item["confidence_reasons"] == []
+
+
+# 40. Legacy NULL evidence remains None (not backfilled from source_text)
+def test_legacy_null_evidence_remains_none(tmp_path):
+    """Legacy rows with NULL evidence_text must remain None, not be backfilled with source_text."""
+    from database import get_academic_item_by_id
+
+    custom_db = tmp_path / "legacy_evidence.db"
+    init_db(custom_db)
+
+    with get_db_connection(custom_db) as conn:
+        conn.execute(
+            """
+            INSERT INTO academic_items (
+                title, category, source_text, evidence_text, confidence, created_at, updated_at
+            ) VALUES (?, ?, ?, NULL, NULL, ?, ?);
+            """,
+            ("Old Item", "Event", "Some old source text.", "2026-01-01T00:00:00", "2026-01-01T00:00:00"),
+        )
+        cursor = conn.execute("SELECT last_insert_rowid();")
+        legacy_id = cursor.fetchone()[0]
+        conn.commit()
+
+    item = get_academic_item_by_id(legacy_id, db_path=custom_db)
+    assert item is not None
+    # Must be None — not "Some old source text." (which would be false backfill)
+    assert item["evidence_text"] is None
+    # source_text itself is preserved correctly
+    assert item["source_text"] == "Some old source text."
+
+
+# 41. UNASSESSED filtering works via API
+def test_unassessed_confidence_filter_works():
+    """GET /api/academic-items?confidence=UNASSESSED returns manually created tasks."""
+    client.post(
+        "/api/academic-items",
+        json={
+            "title": "Filter Unassessed Task",
+            "category": "Announcement",
+            "source_text": "Filter unassessed test source text.",
+        },
+    )
+
+    res = client.get("/api/academic-items?confidence=UNASSESSED")
+    assert res.status_code == 200
+    items = res.json()
+    assert len(items) > 0
+    for it in items:
+        assert it["confidence"] == "UNASSESSED"
+
+
+# 42. Assignment contextualized by workshop is NOT a genuine category conflict
+def test_assignment_workshop_context_not_a_conflict():
+    """
+    'Submit your lab exercise report for the robotics workshop' should produce
+    Assignment category without being penalised for the workshop keyword.
+    The word 'workshop' here is prepositional context, not a conflicting Event task.
+    """
+    from extractor import extract_academic_items
+
+    msg = "Submit your lab exercise report for the robotics workshop on 28/10/2026."
+    results = extract_academic_items([{
+        "text": msg,
+        "sender": "Prof. Kumar",
+        "timestamp_text": "2026-10-19 10:00",
+    }])
+    assert len(results) == 1
+    item = results[0]
+    # Must still be Assignment
+    assert item["category"] == "Assignment"
+    # Confidence should NOT be LOW solely because "workshop" is in the text
+    # (it is contextual context for the submission, not an Event intent)
+    assert item["confidence"] in ("HIGH", "MEDIUM")
+    # Explicit date with deadline language -> HIGH
+    assert item["confidence"] == "HIGH"
+
+
+# 43. Genuine multiple academic intents produce separate candidates
+def test_genuine_multiple_intents_produces_separate_candidates():
+    """
+    'Submit the assignment and prepare for the semester examination.'
+    Contains two genuinely distinct academic intents (Assignment + Exam);
+    they should be extracted as separate candidates.
+    """
+    from extractor import extract_academic_items
+
+    msg = "Submit the assignment and prepare for the semester examination."
+    results = extract_academic_items([{
+        "text": msg,
+        "sender": "Prof. Kumar",
+        "timestamp_text": "2026-10-19 10:00",
+    }])
+    # Two distinct intents -> two candidates
+    assert len(results) == 2
+    cats = {r["category"] for r in results}
+    assert "Assignment" in cats
+    assert "Exam" in cats
+    # Neither should be falsely HIGH without a date
+    for r in results:
+        assert r["confidence"] in ("MEDIUM", "LOW")
+
+
+# 44. Comma-separated independent tasks have isolated evidence
+def test_comma_separated_tasks_have_isolated_evidence():
+    """
+    'Submit assignment 1 on 10/11/2026, CN exam on 12/11/2026.'
+    Should produce separate candidates with non-overlapping evidence.
+    """
+    from extractor import extract_academic_items
+
+    msg = "Submit assignment 1 on 10/11/2026, CN exam on 12/11/2026."
+    results = extract_academic_items([{
+        "text": msg,
+        "sender": "Prof. Kumar",
+        "timestamp_text": "2026-10-19 10:00",
+    }])
+    assert len(results) == 2
+    cats = {r["category"] for r in results}
+    assert "Assignment" in cats
+    assert "Exam" in cats
+
+    # Evidence for the assignment must NOT contain the exam clause and vice versa
+    assign_item = next(r for r in results if r["category"] == "Assignment")
+    exam_item = next(r for r in results if r["category"] == "Exam")
+
+    # source_text is shared (the full message)
+    assert assign_item["source_text"] == msg
+    assert exam_item["source_text"] == msg
+
+    # evidence_text is isolated per task
+    assert "exam" not in assign_item["evidence_text"].lower()
+    assert "assignment" not in exam_item["evidence_text"].lower()
+
+
+# 45. Multi-sentence evidence isolation remains intact (Phase 2 regression)
+def test_multi_sentence_evidence_isolation_regression():
+    """Regression: multi-sentence messages still isolate evidence per task correctly."""
+    from extractor import extract_academic_items
+
+    msg = "DBMS assignment due Friday. CN exam on Monday."
+    results = extract_academic_items([{
+        "text": msg,
+        "sender": "Prof. Kumar",
+        "timestamp_text": "2026-11-14 10:00",  # Friday
+    }])
+    assert len(results) == 2
+    assign_item = next(r for r in results if r["category"] == "Assignment")
+    exam_item = next(r for r in results if r["category"] == "Exam")
+    # Evidence must stay in its own clause
+    assert "exam" not in assign_item["evidence_text"].lower()
+    assert "assignment" not in exam_item["evidence_text"].lower()
+
+
+# 46. Phase 1 editing behavior remains intact (regression)
+def test_phase1_editing_behavior_regression():
+    """Regression: title, category, description, and due_date can still be edited via PATCH."""
+    create_res = client.post(
+        "/api/academic-items",
+        json={
+            "title": "Original Phase1 Title",
+            "category": "Assignment",
+            "source_text": "Original Phase1 source text.",
+        },
+    )
+    assert create_res.status_code == 201
+    item_id = create_res.json()["id"]
+
+    patch_res = client.patch(
+        f"/api/academic-items/{item_id}",
+        json={
+            "title": "Updated Phase1 Title",
+            "category": "Exam",
+            "due_date": "2026-12-01",
+        },
+    )
+    assert patch_res.status_code == 200
+    updated = patch_res.json()
+    assert updated["title"] == "Updated Phase1 Title"
+    assert updated["category"] == "Exam"
+    assert updated["due_date"] == "2026-12-01"
+    # Confidence and evidence must remain unchanged
+    assert updated["confidence"] == "UNASSESSED"
+    assert updated["evidence_text"] is None
+
+
+# 47. Phase 2 date and time extraction regression
+def test_phase2_date_time_extraction_regression():
+    """Regression: date and time extraction from messages still works correctly."""
+    from extractor import extract_academic_items
+
+    msg = "Assignment due on 28th October 2026 by 11:59 PM."
+    results = extract_academic_items([{
+        "text": msg,
+        "sender": "Prof. Kumar",
+        "timestamp_text": "2026-10-19 10:00",
+    }])
+    assert len(results) == 1
+    item = results[0]
+    assert item["due_date"] == "2026-10-28"
+    assert item["deadline_time"] == "23:59"
+    assert item["confidence"] == "HIGH"
+
+
+# 48. Phase 3 deterministic confidence behavior regression
+def test_phase3_deterministic_confidence_regression():
+    """Regression: calculate_confidence remains deterministic across repeated calls."""
+    from extractor import extract_academic_items
+
+    msg = "Assignment 1 on Distributed Systems is due on 28/10/2026."
+    for _ in range(5):
+        results = extract_academic_items([{
+            "text": msg,
+            "sender": "Prof. Kumar",
+            "timestamp_text": "2026-10-19 10:00",
+        }])
+        assert len(results) == 1
+        assert results[0]["confidence"] == "HIGH"
+        assert results[0]["confidence_reasons"] == [
+            "Unambiguous academic category with validated explicit calendar date."
+        ]

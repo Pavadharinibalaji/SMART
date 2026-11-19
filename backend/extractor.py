@@ -77,7 +77,7 @@ TRAILING_PUNCTUATION = ".,!?;:)]}>\"'"
 DEADLINE_INDICATORS = [
     re.compile(r"\bdue\b", re.I),
     re.compile(r"\bdeadlines?\b", re.I),
-    re.compile(r"\bsubmit\s+(?:by|before|on)\b", re.I),
+    re.compile(r"\bsubmit(?:s|ted|ting)?\b.*?\b(?:by|before|on)\b", re.I),
     re.compile(r"\bsubmissions?\s+(?:is|by|deadline|date|before|due)\b", re.I),
     re.compile(r"\blast\s+date\b", re.I),
     re.compile(r"\blast\s+day\b", re.I),
@@ -618,8 +618,197 @@ def classify_message(text: str) -> tuple[str | None, list[str]]:
     return matches[0], matches
 
 
+ALLOWED_CATEGORIES = {"Assignment", "Exam", "Announcement", "Event", "Opportunity"}
+ALLOWED_CONFIDENCE_LEVELS = {"HIGH", "MEDIUM", "LOW", "UNASSESSED"}
+
+# Patterns for detecting prepositional/contextual event references that do NOT indicate
+# a conflicting task intent (e.g. "report for the robotics workshop").
+_PREP_EVENT_CONTEXT = re.compile(
+    r"\b(?:for|at|in|during|towards|regarding|about)\s+"
+    r"(?:the\s+|a\s+|an\s+|our\s+)?"
+    r"(?:[\w-]+\s+)*"
+    r"(?:workshops?|seminars?|conferences?|webinars?|symposiums?|events?)\b",
+    re.IGNORECASE,
+)
+_COMPOUND_NOUN_EVENT = re.compile(
+    r"\b(?:workshops?|seminars?|conferences?|webinars?|symposiums?)\s+"
+    r"(?:assignments?|tasks?|reports?|submissions?|exercises?)\b",
+    re.IGNORECASE,
+)
+_PREP_OPP_CONTEXT = re.compile(
+    r"\b(?:for|at|in|during|towards)\s+"
+    r"(?:the\s+|a\s+|an\s+|our\s+)?"
+    r"(?:[\w-]+\s+)*"
+    r"(?:internships?|hackathons?|competitions?|fellowships?)\b",
+    re.IGNORECASE,
+)
+_PRIMARY_ASSIGNMENT_ACTION = re.compile(
+    r"\b(?:submits?|submitted|submitting|due|coursework|homework|"
+    r"lab\s+(?:report|record|manual|exercise|submission)|"
+    r"project\s+(?:report|submission|demo))\b",
+    re.IGNORECASE,
+)
+
+
+def _is_contextual_secondary_keyword(primary_cat: str, other_cat: str, text: str) -> bool:
+    """Return True when other_cat keywords in text are contextual background rather than a conflicting task intent.
+
+    Example:
+        "Submit your lab exercise report for the robotics workshop on 28/10/2026."
+        -> primary_cat=Assignment, other_cat=Event
+        -> "workshop" is prepositional context for the submission, not an independent Event task.
+
+    Example:
+        "Semester exam assignment guidelines are published."
+        -> primary_cat=Assignment, other_cat=Exam
+        -> "exam" is genuinely a competing task intent (not contextual).
+    """
+    if primary_cat == "Assignment" and other_cat == "Event":
+        has_primary_action = bool(_PRIMARY_ASSIGNMENT_ACTION.search(text))
+        is_prep_context = bool(_PREP_EVENT_CONTEXT.search(text))
+        is_compound_noun = bool(_COMPOUND_NOUN_EVENT.search(text))
+        return has_primary_action and (is_prep_context or is_compound_noun)
+
+    if primary_cat == "Assignment" and other_cat == "Opportunity":
+        has_primary_action = bool(_PRIMARY_ASSIGNMENT_ACTION.search(text))
+        is_prep_context = bool(_PREP_OPP_CONTEXT.search(text))
+        return has_primary_action and is_prep_context
+
+    return False
+
+
+def calculate_confidence(
+    category: str,
+    all_matched_cats: list[str],
+    date_info: dict[str, Any],
+    date_type: str,
+    is_isolated_event_keyword: bool,
+    cluster_text: str,
+) -> tuple[str, list[str]]:
+    """Determine explainable, deterministic confidence level (HIGH, MEDIUM, LOW) and reasons.
+
+    Decision Table / Rules:
+    1. LOW Confidence:
+       - Date is ambiguous or unresolvable (date_status == 'needs_review'):
+         multiple conflicting dates, ambiguous numeric format, missing year, etc.
+         (A candidate with an ambiguous date must never receive HIGH confidence).
+       - Genuinely conflicting or ambiguous category matches where the secondary
+         keyword represents a distinct task intent (not a contextual reference).
+       - Generic keyword 'event' matched without specific academic event context.
+       - Assignment date mentioned without explicit deadline phrasing (date_type == 'mentioned_date').
+    2. MEDIUM Confidence:
+       - Clear category with relative date resolved from message timestamp anchor.
+       - Clear academic task with no date specified (date_status == 'not_found').
+    3. HIGH Confidence:
+       - Clear unambiguous category with explicit, validated calendar date (date_status == 'parsed')
+         and confirmed deadline or event date type.
+
+    Category Conflict Nuance:
+       When multiple categories match but the secondary keywords are prepositional context
+       (e.g. "for the workshop", "at the seminar"), they are treated as contextual information
+       rather than conflicting task intents, and do not reduce confidence to LOW.
+    """
+    reasons: list[str] = []
+    date_status = date_info.get("date_status", "not_found")
+
+    # 1. Ambiguous or incomplete date -> LOW
+    if date_status == "needs_review":
+        reasons.append("Date expression is ambiguous, incomplete, or requires human confirmation.")
+        return "LOW", reasons
+
+    # 2. Category conflict analysis — distinguish genuine conflicts from contextual co-occurrence
+    if len(all_matched_cats) > 1:
+        genuine_conflict = False
+        for other_cat in all_matched_cats:
+            if other_cat == category:
+                continue
+            if not _is_contextual_secondary_keyword(category, other_cat, cluster_text):
+                genuine_conflict = True
+                break
+
+        if genuine_conflict:
+            reasons.append(
+                f"Multiple conflicting academic categories matched ({', '.join(all_matched_cats)})."
+            )
+            return "LOW", reasons
+        # else: secondary keywords are contextual — do not penalise confidence
+
+    # 3. Weak generic 'event' keyword -> LOW
+    if is_isolated_event_keyword:
+        reasons.append("Generic keyword 'event' matched without specific academic event context.")
+        return "LOW", reasons
+
+    # 4. Assignment with mentioned date lacking deadline language -> LOW
+    if category == "Assignment" and date_type == "mentioned_date":
+        reasons.append("Date mentioned without explicit submission deadline phrasing.")
+        return "LOW", reasons
+
+    # 5. Missing date with clear academic task -> MEDIUM
+    if date_status == "not_found":
+        reasons.append("Clear academic task identified, but no deadline or event date was specified.")
+        return "MEDIUM", reasons
+
+    # 6. Relative date resolved from message timestamp -> MEDIUM
+    if date_status == "resolved_from_message_date":
+        reasons.append("Academic task identified with relative date resolved from message timestamp anchor.")
+        return "MEDIUM", reasons
+
+    # 7. Explicit validated calendar date with confirmed task intent -> HIGH
+    if date_status == "parsed" and date_type in ("deadline", "event_date"):
+        reasons.append("Unambiguous academic category with validated explicit calendar date.")
+        return "HIGH", reasons
+
+    # Default fallback -> MEDIUM
+    reasons.append("Candidate academic task extracted with standard rule-based heuristics.")
+    return "MEDIUM", reasons
+
+
+# Comma-split pattern: splits on commas followed by an independent academic clause.
+# Does NOT split dates like "Friday, 20 November 2026" or "November 20, 2026".
+_COMMA_ACADEMIC_SPLIT = re.compile(
+    r",\s*(?="
+    r"(?:(?:the|an|a|your|our|final|internal|semester|next|upcoming|this)\s+)?"
+    r"(?:[A-Za-z0-9_-]+\s+)?"
+    r"(?:exam|examination|test|quiz|assignment|homework|submission|"
+    r"lab\s+(?:record|manual|report|exercise|submission)|"
+    r"project\s+(?:submission|report|deadline|demo|presentation)|"
+    r"workshop|seminar|webinar|conference|hackathon|internship)\b"
+    r"|(?:please\s+)?(?:submit|register|apply|attend|prepare)\b"
+    r")",
+    re.IGNORECASE,
+)
+
+# Conjunction split pattern for splitting on "and/but" before independent academic tasks.
+# The lookahead allows one optional descriptor word (e.g. "semester", "final", "midterm")
+# between the article/preposition and the core academic noun.
+_CONJ_ACADEMIC_SPLIT = re.compile(
+    r"\s+(?:and|but|while)\s+(?="
+    r"(?:the\s+)?"
+    r"(?:prepare\s+(?:for\s+)?|attend\s+|register\s+(?:for\s+)?|submit\s+|write\s+)?"
+    r"(?:(?:the|a|an|your|our)\s+)?"
+    r"(?:semester|midterm|final|internal|upcoming|next|model)?\s*"
+    r"(?:assignment|exam|examination|test|quiz|workshop|seminar|conference|hackathon|internship|submission|registration)\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
 def split_message_into_segments(text: str) -> list[str]:
-    """Split message text into candidate clauses / sentences while preserving abbreviations."""
+    """Split message text into candidate clauses / sentences while preserving abbreviations.
+
+    Splits on:
+    - Sentence-ending punctuation followed by a capital letter or digit.
+    - Exclamation marks, question marks.
+    - Semicolons.
+    - Newlines.
+    - Coordinating conjunctions (and, but, while) before academic nouns.
+    - Commas before independent academic clauses (comma-separated task lists).
+
+    Does NOT split on:
+    - Commas inside dates ("Friday, 20 November 2026", "November 20, 2026").
+    - Commas inside abbreviations (Dr., Prof., etc.).
+    - Commas inside normal sentence structure (non-academic context).
+    """
     if not text:
         return []
 
@@ -631,22 +820,37 @@ def split_message_into_segments(text: str) -> list[str]:
     for i, abbr in enumerate(abbreviations):
         placeholder = f"__ABBR_{i}__"
         abbr_map[placeholder] = abbr
-        protected = re.sub(re.escape(abbr), placeholder, protected, flags=re.IGNORECASE)
+        protected = re.sub(r"\b" + re.escape(abbr), placeholder, protected, flags=re.IGNORECASE)
 
-    split_regex = re.compile(
-        r"(?:\.\s+(?=[A-Z0-9])|[!?]\s+|;\s*|\n+|\s+(?:and|but)\s+(?=(?:the\s+)?(?:assignment|exam|internal|workshop|seminar|conference|hackathon|internship|submission|quiz|registration)\b))",
+    # Primary splits: sentence boundaries, semicolons, newlines
+    sentence_split_regex = re.compile(
+        r"(?:\.\s+(?=[A-Z0-9])|[!?]\s+|;\s*|\n+)",
         re.IGNORECASE,
     )
 
-    raw_segments = split_regex.split(protected)
-    segments: list[str] = []
-    for seg in raw_segments:
+    primary_segments: list[str] = []
+    for seg in sentence_split_regex.split(protected):
         clean = seg.strip()
         if not clean:
             continue
+        # Secondary split: coordinating conjunctions before academic nouns
+        sub_parts = _CONJ_ACADEMIC_SPLIT.split(clean)
+        for part in sub_parts:
+            part = part.strip()
+            if not part:
+                continue
+            # Tertiary split: comma-separated independent academic clauses
+            comma_parts = _COMMA_ACADEMIC_SPLIT.split(part)
+            for cp in comma_parts:
+                cp = cp.strip()
+                if cp:
+                    primary_segments.append(cp)
+
+    segments: list[str] = []
+    for seg in primary_segments:
         for placeholder, original in abbr_map.items():
-            clean = clean.replace(placeholder, original)
-        segments.append(clean)
+            seg = seg.replace(placeholder, original)
+        segments.append(seg)
 
     return segments or [text]
 
@@ -751,8 +955,30 @@ def extract_academic_items(messages: list[dict[str, Any]]) -> list[dict[str, Any
             task_clusters.append(current_cluster)
 
         # Build academic item for each cluster
+        current_text_offset = 0
         for cluster in task_clusters:
-            cluster_text = " ".join(cluster).strip()
+            if cluster:
+                search_pos = current_text_offset
+                start_pos = -1
+                end_pos = -1
+                all_found = True
+                for i, seg in enumerate(cluster):
+                    idx = text.find(seg, search_pos)
+                    if idx == -1:
+                        all_found = False
+                        break
+                    if i == 0:
+                        start_pos = idx
+                    end_pos = idx + len(seg)
+                    search_pos = end_pos
+
+                if all_found and start_pos != -1 and end_pos != -1:
+                    cluster_text = text[start_pos:end_pos].strip()
+                    current_text_offset = end_pos
+                else:
+                    cluster_text = " ".join(cluster).strip()
+            else:
+                cluster_text = ""
             category, all_matched_cats = classify_message(cluster_text)
             if category is None:
                 category = msg_category
@@ -794,15 +1020,37 @@ def extract_academic_items(messages: list[dict[str, Any]]) -> list[dict[str, Any
                 review_required = True
                 review_reasons.append("Date mentioned without explicit deadline phrasing (e.g. 'due', 'submit by').")
 
+            # Category conflict check: only flag review if the secondary keyword represents
+            # a genuine competing task intent, not a contextual prepositional reference.
             if len(all_matched_cats) > 1:
-                review_required = True
-                review_reasons.append(
-                    f"Multiple categories matched ({', '.join(all_matched_cats)}); classified as '{category}'."
+                has_genuine_conflict = any(
+                    not _is_contextual_secondary_keyword(category, other_cat, cluster_text)
+                    for other_cat in all_matched_cats
+                    if other_cat != category
                 )
+                if has_genuine_conflict:
+                    review_required = True
+                    review_reasons.append(
+                        f"Multiple categories matched ({', '.join(all_matched_cats)}); classified as '{category}'."
+                    )
 
             if is_isolated_event_keyword and date_info["date_status"] == "not_found":
                 review_required = True
                 review_reasons.append("Message matched generic word 'event' without specific event terminology or dates.")
+
+            confidence, confidence_reasons = calculate_confidence(
+                category=category,
+                all_matched_cats=all_matched_cats,
+                date_info=date_info,
+                date_type=date_type,
+                is_isolated_event_keyword=is_isolated_event_keyword,
+                cluster_text=cluster_text,
+            )
+
+            if confidence == "LOW":
+                review_required = True
+
+            review_reasons = list(dict.fromkeys(review_reasons))
 
             # Construct title
             lines = [l.strip() for l in cluster if l.strip()]
@@ -819,10 +1067,14 @@ def extract_academic_items(messages: list[dict[str, Any]]) -> list[dict[str, Any
                 "time_text": time_info["time_text"],
                 "deadline_time": time_info["deadline_time"],
                 "urls": urls,
+                "evidence_text": cluster_text,
+                "confidence": confidence,
+                "confidence_reasons": confidence_reasons,
                 "source_message_id": message.get("message_id"),
                 "source_sender": sender,
                 "source_timestamp": timestamp_text,
                 "source_text": text,
+                "source_filename": message.get("source_filename") or message.get("filename") or "",
                 "extraction_method": "rules",
                 "review_required": review_required,
                 "review_reasons": review_reasons,

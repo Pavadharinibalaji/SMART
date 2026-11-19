@@ -3,6 +3,7 @@
 from datetime import date
 import pytest
 from extractor import (
+    calculate_confidence,
     classify_message,
     detect_date,
     extract_academic_items,
@@ -482,3 +483,449 @@ def test_ambiguous_numeric_date_remains_flagged():
     assert res["due_date"] is None
     assert res["date_status"] == "needs_review"
     assert "ambiguous" in res["date_reasons"][0].lower()
+
+
+# ==============================================================================
+# Phase 3: Confidence Scoring & Evidence Intelligence Tests
+# ==============================================================================
+
+
+# 26. High-confidence explicit assignment with a clear date
+def test_confidence_high_explicit_assignment():
+    messages = [
+        {
+            "message_id": 201,
+            "timestamp_text": "19/10/2026, 9:00 am",
+            "sender": "Prof. Turing",
+            "text": "Assignment 1 on Distributed Consensus is released. The submission deadline is due on 28/10/2026.",
+        }
+    ]
+    items = extract_academic_items(messages)
+    assert len(items) == 1
+    item = items[0]
+    assert item["confidence"] == "HIGH"
+    assert item["category"] == "Assignment"
+    assert item["due_date"] == "2026-10-28"
+    assert item["date_type"] == "deadline"
+    assert item["review_required"] is False
+    assert any("explicit calendar date" in r.lower() for r in item["confidence_reasons"])
+    assert "The submission deadline is due on 28/10/2026." in item["evidence_text"]
+
+
+# 27. High-confidence examination with an explicit date
+def test_confidence_high_explicit_examination():
+    messages = [
+        {
+            "message_id": 202,
+            "timestamp_text": "19/10/2026, 9:00 am",
+            "sender": "Coordinator",
+            "text": "The Distributed Systems midterm exam will be held on 15/11/2026 at Hall B.",
+        }
+    ]
+    items = extract_academic_items(messages)
+    assert len(items) == 1
+    item = items[0]
+    assert item["confidence"] == "HIGH"
+    assert item["category"] == "Exam"
+    assert item["due_date"] == "2026-11-15"
+    assert item["date_type"] == "event_date"
+    assert item["review_required"] is False
+    assert any("explicit calendar date" in r.lower() for r in item["confidence_reasons"])
+
+
+# 28. Medium-confidence task with a resolvable relative date
+def test_confidence_medium_relative_date():
+    messages = [
+        {
+            "message_id": 203,
+            "timestamp_text": "19/10/2026, 9:00 am",  # Monday
+            "sender": "TA Sarah",
+            "text": "DBMS assignment submission is due Friday.",
+        }
+    ]
+    items = extract_academic_items(messages)
+    assert len(items) == 1
+    item = items[0]
+    assert item["confidence"] == "MEDIUM"
+    assert item["category"] == "Assignment"
+    assert item["due_date"] == "2026-10-23"
+    assert any("relative date resolved" in r.lower() for r in item["confidence_reasons"])
+
+
+# 29. Low-confidence task with ambiguous dates
+def test_confidence_low_ambiguous_dates():
+    # Multiple candidate dates in single task
+    messages = [
+        {
+            "message_id": 204,
+            "timestamp_text": "19/10/2026, 9:00 am",
+            "sender": "Prof",
+            "text": "The project demo will be held on either 10/11/2026 or 12/11/2026.",
+        }
+    ]
+    items = extract_academic_items(messages)
+    assert len(items) == 1
+    item = items[0]
+    assert item["confidence"] == "LOW"
+    assert item["due_date"] is None
+    assert item["review_required"] is True
+    assert any("ambiguous" in r.lower() for r in item["confidence_reasons"])
+
+
+# 30. Task with no date but strong task evidence
+def test_confidence_medium_no_date_strong_evidence():
+    messages = [
+        {
+            "message_id": 205,
+            "timestamp_text": "19/10/2026, 9:00 am",
+            "sender": "Prof",
+            "text": "Assignment 2 is released. Please check the course portal for instructions and test cases.",
+        }
+    ]
+    items = extract_academic_items(messages)
+    assert len(items) == 1
+    item = items[0]
+    assert item["confidence"] == "MEDIUM"
+    assert item["category"] == "Assignment"
+    assert item["due_date"] is None
+    assert any("no deadline or event date" in r.lower() for r in item["confidence_reasons"])
+
+
+# 31. Ambiguous category classification
+def test_confidence_low_ambiguous_category():
+    # Multiple conflicting categories in one clause
+    messages = [
+        {
+            "message_id": 206,
+            "timestamp_text": "19/10/2026, 9:00 am",
+            "sender": "Office",
+            "text": "Semester exam assignment guidelines are published.",
+        }
+    ]
+    items = extract_academic_items(messages)
+    assert len(items) == 1
+    item = items[0]
+    assert item["confidence"] == "LOW"
+    assert item["review_required"] is True
+    assert any("multiple conflicting" in r.lower() for r in item["confidence_reasons"])
+
+
+# 32. Multiple tasks with correctly separated evidence
+def test_multi_item_separated_evidence_and_confidence():
+    messages = [
+        {
+            "message_id": 207,
+            "timestamp_text": "19/10/2026, 9:00 am",  # Monday
+            "sender": "Coordinator",
+            "text": "DBMS assignment submission is Friday. CN internal exam is 25/11/2026.",
+        }
+    ]
+    items = extract_academic_items(messages)
+    assert len(items) == 2
+
+    # Task 1: Assignment due Friday -> relative date -> MEDIUM
+    assert items[0]["category"] == "Assignment"
+    assert items[0]["due_date"] == "2026-10-23"
+    assert items[0]["confidence"] == "MEDIUM"
+    assert "DBMS assignment submission is Friday" in items[0]["evidence_text"]
+    assert "CN internal exam" not in items[0]["evidence_text"]
+
+    # Task 2: Exam on 25/11/2026 -> explicit date -> HIGH
+    assert items[1]["category"] == "Exam"
+    assert items[1]["due_date"] == "2026-11-25"
+    assert items[1]["confidence"] == "HIGH"
+    assert "CN internal exam is 25/11/2026" in items[1]["evidence_text"]
+    assert "DBMS assignment" not in items[1]["evidence_text"]
+
+
+# 33. Evidence preservation for multiline messages
+def test_multiline_evidence_preservation():
+    messages = [
+        {
+            "message_id": 208,
+            "timestamp_text": "19/10/2026, 9:00 am",
+            "sender": "Teacher",
+            "text": "Assignment 1 is released.\nThe deadline is 28/10/2026.\nSubmit code on portal.",
+        }
+    ]
+    items = extract_academic_items(messages)
+    assert len(items) == 1
+    item = items[0]
+    assert item["confidence"] == "HIGH"
+    # Evidence text reflects the source task text without alteration
+    assert "Assignment 1 is released" in item["evidence_text"]
+    assert "deadline is 28/10/2026" in item["evidence_text"]
+    assert item["source_text"] == messages[0]["text"]
+
+
+# 34. Confidence consistency across repeated extraction runs
+def test_confidence_determinism_repeated_runs():
+    messages = [
+        {
+            "message_id": 209,
+            "timestamp_text": "19/10/2026, 9:00 am",
+            "sender": "Prof",
+            "text": "Project demo is due on 28/10/2026. Register for the workshop before Wednesday.",
+        }
+    ]
+    first_run = extract_academic_items(messages)
+    for _ in range(5):
+        subsequent_run = extract_academic_items(messages)
+        assert len(first_run) == len(subsequent_run)
+        for i in range(len(first_run)):
+            assert first_run[i]["confidence"] == subsequent_run[i]["confidence"]
+            assert first_run[i]["confidence_reasons"] == subsequent_run[i]["confidence_reasons"]
+            assert first_run[i]["evidence_text"] == subsequent_run[i]["evidence_text"]
+
+
+# 35. Evidence text is an exact substring of source message
+def test_evidence_text_is_exact_source_substring():
+    messages = [
+        {
+            "message_id": 210,
+            "timestamp_text": "19/10/2026, 9:00 am",
+            "sender": "Admin",
+            "text": "Assignment 1 is due on 28/10/2026. Important Notice: holiday declared tomorrow for all students.",
+        }
+    ]
+    items = extract_academic_items(messages)
+    assert len(items) == 2
+    for item in items:
+        # Every evidence_text must be derived from the source text
+        assert item["evidence_text"] in item["source_text"] or item["evidence_text"].strip() in item["source_text"]
+
+
+# ==============================================================================
+# Phase 3.1: Category Conflict Detection & Compound Clause Evidence Isolation
+# ==============================================================================
+
+
+# 36. Assignment contextualized by workshop is NOT a genuine category conflict
+def test_assignment_workshop_contextual_reference_not_conflict():
+    """
+    'Submit your lab exercise report for the robotics workshop' — 'workshop' is
+    prepositional context for the submission, not an independent Event task.
+    Confidence must NOT be LOW solely because 'workshop' appeared.
+    """
+    msg = "Submit your lab exercise report for the robotics workshop on 28/10/2026."
+    results = extract_academic_items([{
+        "text": msg,
+        "sender": "Prof. Kumar",
+        "timestamp_text": "2026-10-19 10:00",
+    }])
+    assert len(results) == 1
+    item = results[0]
+    assert item["category"] == "Assignment"
+    # Explicit date with deadline language -> HIGH (not penalised for contextual 'workshop')
+    assert item["confidence"] == "HIGH"
+    # review_required should NOT be True due to a false category conflict
+    assert item["review_required"] is False
+
+
+# 37. Assignment report for a hackathon — contextual opportunity, not genuine conflict
+def test_assignment_hackathon_contextual_reference_not_conflict():
+    """'Submit report for the annual hackathon' — 'hackathon' is contextual, not a competing Opportunity task."""
+    msg = "Submit report for the annual hackathon by 30/10/2026."
+    results = extract_academic_items([{
+        "text": msg,
+        "sender": "Prof. Kumar",
+        "timestamp_text": "2026-10-19 10:00",
+    }])
+    assert len(results) == 1
+    item = results[0]
+    assert item["category"] == "Assignment"
+    assert item["confidence"] in ("HIGH", "MEDIUM")
+
+
+# 38. Genuine assignment + exam conflict -> LOW confidence
+def test_genuine_assignment_exam_conflict_produces_low_confidence():
+    """
+    'Semester exam assignment guidelines are published.' — both 'exam' and 'assignment'
+    are present in the same clause without a clear primary action verb distinguishing them.
+    This is a genuine category conflict and must produce LOW confidence.
+    """
+    msg = "Semester exam assignment guidelines are published."
+    results = extract_academic_items([{
+        "text": msg,
+        "sender": "Prof. Kumar",
+        "timestamp_text": "2026-10-19 10:00",
+    }])
+    assert len(results) == 1
+    item = results[0]
+    # Genuine conflict -> LOW
+    assert item["confidence"] == "LOW"
+    assert item["review_required"] is True
+
+
+# 39. Comma-separated independent tasks produce isolated evidence
+def test_comma_separated_tasks_evidence_isolation():
+    """
+    'Submit assignment 1 on 10/11/2026, CN exam on 12/11/2026.'
+    Must produce two candidates with non-overlapping evidence_text.
+    """
+    msg = "Submit assignment 1 on 10/11/2026, CN exam on 12/11/2026."
+    results = extract_academic_items([{
+        "text": msg,
+        "sender": "Prof. Kumar",
+        "timestamp_text": "2026-10-19 10:00",
+    }])
+    assert len(results) == 2
+    cats = {r["category"] for r in results}
+    assert "Assignment" in cats
+    assert "Exam" in cats
+
+    assign_item = next(r for r in results if r["category"] == "Assignment")
+    exam_item = next(r for r in results if r["category"] == "Exam")
+
+    # source_text is shared across both
+    assert assign_item["source_text"] == msg
+    assert exam_item["source_text"] == msg
+
+    # Evidence must not cross task boundaries
+    assert "CN exam" not in assign_item["evidence_text"]
+    assert "assignment 1" not in exam_item["evidence_text"].lower()
+
+
+# 40. Date-safe comma preservation: "Friday, 20 November 2026" must NOT be split
+def test_date_comma_not_split():
+    """Commas inside dates must NOT be treated as task separators."""
+    msg = "Assignment is due on Friday, 20 November 2026."
+    results = extract_academic_items([{
+        "text": msg,
+        "sender": "Prof. Kumar",
+        "timestamp_text": "2026-10-19 10:00",
+    }])
+    # Only one task, not split at the comma inside the date
+    assert len(results) == 1
+    item = results[0]
+    assert item["category"] == "Assignment"
+
+
+# 41. Normal sentence commas are preserved (non-academic lists)
+def test_normal_comma_preserved_in_non_academic_context():
+    """Commas in non-academic contexts must not trigger a split."""
+    msg = "Subjects covered include OS, DBMS, and CN. Submit assignment by Friday."
+    results = extract_academic_items([{
+        "text": msg,
+        "sender": "Prof. Kumar",
+        "timestamp_text": "2026-11-14 10:00",  # Friday
+    }])
+    # Should produce one assignment (not misparse "OS, DBMS" as separate tasks)
+    assert len(results) == 1
+    assert results[0]["category"] == "Assignment"
+
+
+# 42. is_contextual_secondary_keyword distinguishes context from conflict
+def test_is_contextual_secondary_keyword():
+    """Unit test for the _is_contextual_secondary_keyword helper function."""
+    from extractor import _is_contextual_secondary_keyword
+
+    # Prepositional workshop context for an assignment -> contextual (True)
+    assert _is_contextual_secondary_keyword(
+        "Assignment", "Event",
+        "Submit your lab exercise report for the robotics workshop on 28/10/2026."
+    ) is True
+
+    # Hackathon as prepositional context for a submission -> contextual (True)
+    assert _is_contextual_secondary_keyword(
+        "Assignment", "Opportunity",
+        "Submit report for the annual hackathon by 30/10/2026."
+    ) is True
+
+    # Exam + assignment: no primary assignment action verb dominating -> NOT contextual (False)
+    assert _is_contextual_secondary_keyword(
+        "Assignment", "Exam",
+        "Semester exam assignment guidelines are published."
+    ) is False
+
+    # Assignment + exam with two distinct intents -> NOT contextual (False)
+    assert _is_contextual_secondary_keyword(
+        "Assignment", "Exam",
+        "Submit the assignment and prepare for the semester examination."
+    ) is False
+
+
+# 43. Evidence reconstruction edge cases (Phase 3.2.5)
+def test_evidence_reconstruction_two_identical_consecutive_segments():
+    """Verify that two identical consecutive segments in a cluster are both preserved."""
+    messages = [
+        {
+            "message_id": 301,
+            "timestamp_text": "2026-11-01 10:00:00",
+            "sender": "Prof",
+            "text": "Assignment 1 due Nov 25.\nAssignment 1 due Nov 25.",
+        }
+    ]
+    items = extract_academic_items(messages)
+    assert len(items) == 1
+    assert items[0]["evidence_text"] in items[0]["source_text"]
+    assert items[0]["evidence_text"] == "Assignment 1 due Nov 25.\nAssignment 1 due Nov 25."
+
+
+def test_evidence_reconstruction_repeated_first_and_last_segments():
+    """Verify that repeated first and last segments preserve the complete cluster span."""
+    messages = [
+        {
+            "message_id": 302,
+            "timestamp_text": "2026-11-01 10:00:00",
+            "sender": "Prof",
+            "text": "Submit assignment 1.\nImportant details.\nSubmit assignment 1 on Nov 25.",
+        }
+    ]
+    items = extract_academic_items(messages)
+    assert len(items) == 1
+    assert items[0]["evidence_text"] in items[0]["source_text"]
+    assert items[0]["evidence_text"] == "Submit assignment 1.\nImportant details.\nSubmit assignment 1 on Nov 25."
+
+
+def test_evidence_reconstruction_repeated_announcements_separated_by_different_sentences():
+    """Verify that repeated announcements separated by another sentence preserve independent spans."""
+    messages = [
+        {
+            "message_id": 303,
+            "timestamp_text": "2026-11-01 10:00:00",
+            "sender": "Prof",
+            "text": "Assignment 1 due Nov 25.\nExam on Dec 01.\nAssignment 1 due Nov 25.",
+        }
+    ]
+    items = extract_academic_items(messages)
+    assert len(items) == 3
+    for it in items:
+        assert it["evidence_text"] in it["source_text"]
+    assert items[0]["evidence_text"] == "Assignment 1 due Nov 25"
+    assert items[1]["evidence_text"] == "Exam on Dec 01"
+    assert items[2]["evidence_text"] == "Assignment 1 due Nov 25."
+
+
+def test_evidence_reconstruction_multiline_clusters_with_repeated_dates():
+    """Verify that multiline clusters with repeated dates preserve all segments in evidence."""
+    messages = [
+        {
+            "message_id": 304,
+            "timestamp_text": "2026-11-01 10:00:00",
+            "sender": "Prof",
+            "text": "Workshop on 15/12/2026.\nMorning session on 15/12/2026.\nEvening session on 15/12/2026.",
+        }
+    ]
+    items = extract_academic_items(messages)
+    assert len(items) == 1
+    assert items[0]["evidence_text"] in items[0]["source_text"]
+    assert items[0]["evidence_text"] == "Workshop on 15/12/2026.\nMorning session on 15/12/2026.\nEvening session on 15/12/2026."
+
+
+def test_evidence_reconstruction_punctuation_and_blank_line_preservation():
+    """Verify that blank lines, punctuation, and abbreviations are preserved without mutilation."""
+    messages = [
+        {
+            "message_id": 305,
+            "timestamp_text": "2026-11-01 10:00:00",
+            "sender": "Prof",
+            "text": "Notice:\n\nAssignment 1 due 20/11/2026!\n\nPlease check LMS.",
+        }
+    ]
+    items = extract_academic_items(messages)
+    assert len(items) == 2
+    for it in items:
+        assert it["evidence_text"] in it["source_text"]
+    assert items[0]["evidence_text"] == "Notice:"
+    assert items[1]["evidence_text"] == "Assignment 1 due 20/11/2026!\n\nPlease check LMS."

@@ -106,6 +106,9 @@ export async function getAcademicItems(filters = {}) {
   if (filters.due_after) {
     params.append("due_after", filters.due_after);
   }
+  if (filters.confidence && filters.confidence !== "ALL") {
+    params.append("confidence", filters.confidence.toUpperCase());
+  }
 
   const queryString = params.toString() ? `?${params.toString()}` : "";
   const endpointUrl = `${API_BASE_URL}/api/academic-items${queryString}`;

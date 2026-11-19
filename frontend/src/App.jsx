@@ -1,5 +1,9 @@
 import { useState, useEffect, useId, useMemo, useCallback } from "react";
 import "./App.css";
+import ConfidenceBadge from "./components/ConfidenceBadge";
+import ReviewIndicator from "./components/ReviewIndicator";
+import EvidenceDrawer from "./components/EvidenceDrawer";
+import { matchesConfidence } from "./utils/confidenceFilter";
 import {
   extractAcademic,
   saveAcademicItem,
@@ -30,6 +34,7 @@ export default function App() {
   const [reviewCount, setReviewCount] = useState(0);
   const [categoryCounts, setCategoryCounts] = useState({});
   const [selectedFilter, setSelectedFilter] = useState("ALL");
+  const [candidateConfidence, setCandidateConfidence] = useState("ALL");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
@@ -47,11 +52,13 @@ export default function App() {
   const [taskSearch, setTaskSearch] = useState("");
   const [taskCategory, setTaskCategory] = useState("ALL");
   const [taskStatus, setTaskStatus] = useState("ALL");
+  const [taskConfidence, setTaskConfidence] = useState("ALL");
   const [taskDueBefore, setTaskDueBefore] = useState("");
   const [taskDueAfter, setTaskDueAfter] = useState("");
 
   // Modals & Notifications
   const [deleteModalItem, setDeleteModalItem] = useState(null);
+  const [selectedEvidenceItem, setSelectedEvidenceItem] = useState(null);
   const [exportNotice, setExportNotice] = useState("");
 
   const fileInputId = useId();
@@ -161,6 +168,7 @@ export default function App() {
       );
       setCategoryCounts(data.category_counts ?? {});
       setSelectedFilter("ALL");
+      setCandidateConfidence("ALL");
       setSuccess("Chat processed and candidate items identified successfully.");
 
       // Check if any candidate item was already saved in previous sessions
@@ -334,11 +342,16 @@ export default function App() {
   // Filtered candidate items (Analyze Chat tab)
   const filteredCandidateItems = useMemo(() => {
     return items.filter((item) => {
-      if (selectedFilter === "ALL") return true;
-      if (selectedFilter === "REVIEW") return item.review_required;
-      return item.category === selectedFilter;
+      // Category / Review filter
+      if (selectedFilter === "REVIEW" && !item.review_required) return false;
+      if (selectedFilter !== "ALL" && selectedFilter !== "REVIEW" && item.category !== selectedFilter) return false;
+
+      // Confidence filter
+      if (!matchesConfidence(item, candidateConfidence)) return false;
+
+      return true;
     });
-  }, [items, selectedFilter]);
+  }, [items, selectedFilter, candidateConfidence]);
 
   // Filtered saved tasks (My Academic Tasks tab)
   const filteredTasks = useMemo(() => {
@@ -350,6 +363,11 @@ export default function App() {
 
       // Status filter
       if (taskStatus !== "ALL" && (task.status || "").toLowerCase() !== taskStatus.toLowerCase()) {
+        return false;
+      }
+
+      // Confidence filter
+      if (!matchesConfidence(task, taskConfidence)) {
         return false;
       }
 
@@ -380,7 +398,7 @@ export default function App() {
 
       return true;
     });
-  }, [savedTasks, taskCategory, taskStatus, taskSearch, taskDueBefore, taskDueAfter]);
+  }, [savedTasks, taskCategory, taskStatus, taskConfidence, taskSearch, taskDueBefore, taskDueAfter]);
 
   // Tasks statistics
   const taskStats = useMemo(() => {
@@ -397,6 +415,7 @@ export default function App() {
     taskSearch !== "" ||
     taskCategory !== "ALL" ||
     taskStatus !== "ALL" ||
+    taskConfidence !== "ALL" ||
     taskDueBefore !== "" ||
     taskDueAfter !== "";
 
@@ -404,6 +423,7 @@ export default function App() {
     setTaskSearch("");
     setTaskCategory("ALL");
     setTaskStatus("ALL");
+    setTaskConfidence("ALL");
     setTaskDueBefore("");
     setTaskDueAfter("");
   };
@@ -667,11 +687,40 @@ export default function App() {
                   })}
                 </div>
 
+                {/* Confidence Filter Pills */}
+                <div className="confidence-filter-bar" role="toolbar" aria-label="Filter candidate items by confidence">
+                  <span className="filter-group-label">Confidence:</span>
+                  {["ALL", "HIGH", "MEDIUM", "LOW", "UNASSESSED"].map((level) => (
+                    <button
+                      key={level}
+                      type="button"
+                      onClick={() => setCandidateConfidence(level)}
+                      className={`filter-btn filter-btn-confidence ${candidateConfidence === level ? "active" : ""}`}
+                      aria-pressed={candidateConfidence === level}
+                    >
+                      {level === "ALL" ? "All Confidence" : level}
+                    </button>
+                  ))}
+                </div>
+
                 {/* Candidate Items List */}
                 <div className="items-list">
                   {filteredCandidateItems.length === 0 ? (
                     <div className="empty-filter">
-                      <p>No candidate items match the selected filter.</p>
+                      <p>No candidate items match the selected filter criteria.</p>
+                      {(selectedFilter !== "ALL" || candidateConfidence !== "ALL") && (
+                        <button
+                          type="button"
+                          className="btn btn-secondary"
+                          style={{ marginTop: 8 }}
+                          onClick={() => {
+                            setSelectedFilter("ALL");
+                            setCandidateConfidence("ALL");
+                          }}
+                        >
+                          Clear Filters
+                        </button>
+                      )}
                     </div>
                   ) : (
                     filteredCandidateItems.map((item, idx) => {
@@ -703,11 +752,16 @@ export default function App() {
                                 {item.category}
                               </span>
 
-                              {item.review_required && (
-                                <span className="review-pill">
-                                  Needs Human Review
-                                </span>
-                              )}
+                              <ConfidenceBadge
+                                confidence={item.confidence}
+                                reasons={item.confidence_reasons}
+                              />
+
+                              <ReviewIndicator
+                                reviewRequired={item.review_required}
+                                confidence={item.confidence}
+                                reasons={item.review_reasons && item.review_reasons.length > 0 ? item.review_reasons : item.confidence_reasons}
+                              />
 
                               {item.date_type && item.date_type !== "none" && (
                                 <span className="datetype-pill">
@@ -744,16 +798,12 @@ export default function App() {
                           </div>
 
                           {/* Review Explanations */}
-                          {item.review_required && Array.isArray(item.review_reasons) && item.review_reasons.length > 0 && (
-                            <div className="review-reasons-box">
-                              <span className="review-box-title">Why this item requires review:</span>
-                              <ul>
-                                {item.review_reasons.map((reason, rIdx) => (
-                                  <li key={rIdx}>{reason}</li>
-                                ))}
-                              </ul>
-                            </div>
-                          )}
+                          <ReviewIndicator
+                            reviewRequired={item.review_required}
+                            confidence={item.confidence}
+                            reasons={item.review_reasons && item.review_reasons.length > 0 ? item.review_reasons : item.confidence_reasons}
+                            variant="box"
+                          />
 
                           {/* Extracted URLs */}
                           {Array.isArray(item.urls) && item.urls.length > 0 && (
@@ -794,7 +844,7 @@ export default function App() {
 
                           {/* Save to Tasks Action Row */}
                           <div className="candidate-actions">
-                            <div>
+                            <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
                               {isSaved ? (
                                 <span className="btn-saved">
                                   <span>✓</span> Already Saved
@@ -819,6 +869,15 @@ export default function App() {
                                   )}
                                 </button>
                               )}
+
+                              <button
+                                type="button"
+                                className="btn-evidence"
+                                onClick={() => setSelectedEvidenceItem(item)}
+                                aria-label={`View evidence for ${item.title}`}
+                              >
+                                🔍 Evidence
+                              </button>
                             </div>
 
                             {saveInfo.message && (
@@ -1032,6 +1091,24 @@ export default function App() {
                   </button>
                 ))}
               </div>
+
+              {/* Confidence Filter Pills */}
+              <div className="status-pill-group" style={{ marginTop: "10px" }}>
+                <span className="status-control-label" style={{ alignSelf: "center" }}>
+                  Confidence:
+                </span>
+                {["ALL", "HIGH", "MEDIUM", "LOW", "UNASSESSED"].map((level) => (
+                  <button
+                    key={level}
+                    type="button"
+                    onClick={() => setTaskConfidence(level)}
+                    className={`status-tab-btn ${taskConfidence === level ? "active" : ""}`}
+                    aria-pressed={taskConfidence === level}
+                  >
+                    {level === "ALL" ? "All Confidence" : level}
+                  </button>
+                ))}
+              </div>
             </div>
 
             {/* Saved Tasks List */}
@@ -1062,7 +1139,7 @@ export default function App() {
               <div className="card empty-card">
                 <div className="empty-icon" aria-hidden="true">🔍</div>
                 <h3>No tasks match your filters</h3>
-                <p>Try adjusting your search keywords, status filter, or date range.</p>
+                <p>Try adjusting your search keywords, category, status, confidence, or date range.</p>
                 <button
                   type="button"
                   onClick={handleClearTaskFilters}
@@ -1107,6 +1184,17 @@ export default function App() {
                             {task.status ? task.status.toUpperCase() : "PENDING"}
                           </span>
 
+                          <ConfidenceBadge
+                            confidence={task.confidence}
+                            reasons={task.confidence_reasons}
+                          />
+
+                          <ReviewIndicator
+                            reviewRequired={task.review_required}
+                            confidence={task.confidence}
+                            reasons={task.review_reasons && task.review_reasons.length > 0 ? task.review_reasons : task.confidence_reasons}
+                          />
+
                           {task.date_type && task.date_type !== "none" && task.date_type !== "unknown" && (
                             <span className="datetype-pill">
                               {task.date_type === "deadline" ? "Submission Deadline" : "Event Date"}
@@ -1144,17 +1232,13 @@ export default function App() {
                         )}
                       </div>
 
-                      {/* Review Warning if required */}
-                      {task.review_required && Array.isArray(task.review_reasons) && task.review_reasons.length > 0 && (
-                        <div className="review-reasons-box">
-                          <span className="review-box-title">Why this item requires review:</span>
-                          <ul>
-                            {task.review_reasons.map((reason, rIdx) => (
-                              <li key={rIdx}>{reason}</li>
-                            ))}
-                          </ul>
-                        </div>
-                      )}
+                      {/* Review Explanations */}
+                      <ReviewIndicator
+                        reviewRequired={task.review_required}
+                        confidence={task.confidence}
+                        reasons={task.review_reasons && task.review_reasons.length > 0 ? task.review_reasons : task.confidence_reasons}
+                        variant="box"
+                      />
 
                       {/* Expandable Source Evidence */}
                       <details className="source-evidence">
@@ -1213,7 +1297,16 @@ export default function App() {
                           {isUpdating && <span className="spinner" aria-hidden="true"></span>}
                         </div>
 
-                        <div>
+                        <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                          <button
+                            type="button"
+                            className="btn-evidence"
+                            onClick={() => setSelectedEvidenceItem(task)}
+                            aria-label={`View evidence for ${task.title}`}
+                          >
+                            🔍 Evidence
+                          </button>
+
                           <button
                             type="button"
                             onClick={() => setDeleteModalItem(task)}
@@ -1274,6 +1367,14 @@ export default function App() {
             </div>
           </div>
         </div>
+      )}
+
+      {/* Evidence Inspection Drawer */}
+      {selectedEvidenceItem && (
+        <EvidenceDrawer
+          item={selectedEvidenceItem}
+          onClose={() => setSelectedEvidenceItem(null)}
+        />
       )}
 
       {/* Footer */}

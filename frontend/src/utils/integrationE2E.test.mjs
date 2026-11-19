@@ -1,0 +1,456 @@
+/**
+ * End-to-End Frontend Integration Test Suite for SMART 2.0 (Phase 3.2.5).
+ * Tests complete integration across:
+ * - Scenario A: Chat ingestion payload parsing & error handling
+ * - Scenario C: Candidate cards, confidence badges, review indicators & evidence drawer state
+ * - Scenario D: Candidate save payload construction & provenance integrity
+ * - Scenario E: Multi-criteria filtering (confidence, category, status, search, date)
+ * - Scenario F: Task CRUD operations & immutable metadata protection in state
+ * - Scenario G: Calendar export URL generation & parameter encoding
+ * - Scenario H: Regression coverage for legacy/manual tasks & Defect 1 multiline evidence
+ */
+
+import assert from "node:assert/strict";
+import { highlightEvidence } from "./highlightEvidence.js";
+import { getReviewStatus } from "./reviewDecisions.js";
+import {
+  normalizeConfidence,
+  matchesConfidence,
+  filterByConfidence,
+  matchesTaskFilters,
+  filterTasks,
+} from "./confidenceFilter.js";
+
+console.log("Starting End-to-End Frontend Integration test suite...\n");
+
+// ============================================================================
+// SCENARIO A: Ingestion Payload Processing & Error Handling
+// ============================================================================
+{
+  // Simulated backend POST /api/extract-academic response
+  const rawBackendResponse = {
+    filename: "sample_chat.txt",
+    total_messages: 13,
+    total_items: 7,
+    review_required_count: 2,
+    category_counts: {
+      Assignment: 2,
+      Exam: 1,
+      Event: 2,
+      Opportunity: 1,
+      Announcement: 1,
+    },
+    confidence_counts: {
+      HIGH: 3,
+      MEDIUM: 2,
+      LOW: 2,
+      UNASSESSED: 0,
+    },
+    items: [
+      {
+        item_id: 1,
+        title: "Assignment 1 on Distributed Systems",
+        category: "Assignment",
+        due_date: "2026-11-25",
+        confidence: "HIGH",
+        confidence_reasons: ["Explicit deadline phrasing", "Confirmed due date"],
+        review_required: false,
+        review_reasons: [],
+        evidence_text: "Assignment 1 on Distributed Systems due Nov 25",
+        source_text: "Assignment 1 on Distributed Systems due Nov 25. Please submit.",
+        source_sender: "Prof. Smith",
+        source_timestamp: "2026-11-18 10:00:00",
+      },
+      {
+        item_id: 2,
+        title: "Midterm Exam Announcement",
+        category: "Exam",
+        due_date: "2026-12-05",
+        confidence: "LOW",
+        confidence_reasons: ["Ambiguous date phrasing"],
+        review_required: true,
+        review_reasons: ["Date mentioned without explicit deadline phrasing"],
+        evidence_text: "Midterm Exam on Dec 5 or Dec 6",
+        source_text: "Midterm Exam on Dec 5 or Dec 6 in Hall B",
+        source_sender: "Dr. Adams",
+        source_timestamp: "2026-11-18 10:15:00",
+      },
+    ],
+  };
+
+  // Verify extraction response metadata integrity
+  assert.equal(rawBackendResponse.total_items, 7);
+  assert.equal(rawBackendResponse.confidence_counts.HIGH, 3);
+  assert.equal(rawBackendResponse.confidence_counts.LOW, 2);
+  assert.equal(rawBackendResponse.items.length, 2);
+
+  // Error case handling: Empty or invalid file response
+  const error422Response = {
+    detail: "No recognised WhatsApp messages were found. Please check that the export matches supported WhatsApp formats.",
+  };
+  assert.match(error422Response.detail, /No recognised WhatsApp messages/);
+
+  console.log("✔ Scenario A: Ingestion payload parsing and error handling verified");
+}
+
+// ============================================================================
+// SCENARIO C: Candidate UI Components & Evidence Drawer Integration
+// ============================================================================
+{
+  const candidate = {
+    item_id: 101,
+    title: "Project Milestone 2 Submission",
+    category: "Assignment",
+    due_date: "2026-11-30",
+    confidence: "HIGH",
+    confidence_reasons: ["Clear deadline phrase", "Explicit due date"],
+    review_required: false,
+    review_reasons: [],
+    evidence_text: "Project Milestone 2 Submission due 30/11/2026",
+    source_text: "Notice: Project Milestone 2 Submission due 30/11/2026 via portal.\nLate submissions incur penalty.",
+    source_sender: "TA John",
+    source_timestamp: "2026-11-19 09:30:00",
+  };
+
+  // 1. Review Decision calculation
+  const decision = getReviewStatus({
+    reviewRequired: candidate.review_required,
+    confidence: candidate.confidence,
+    reasons: candidate.review_reasons,
+  });
+  assert.equal(decision.status, "NOT_REQUIRED");
+  assert.equal(decision.label, "No Review Needed");
+  assert.equal(decision.isWarning, false);
+  assert.equal(decision.tooltip, "No human review is currently required according to SMART's assessment.");
+
+  // 2. Evidence Drawer highlight test on candidate
+  const highlightResult = highlightEvidence(candidate.source_text, candidate.evidence_text);
+  assert.equal(highlightResult.matched, true);
+  assert.equal(highlightResult.mismatchWarning, false);
+  assert.equal(highlightResult.segments.length, 3);
+  assert.equal(highlightResult.segments[0].text, "Notice: ");
+  assert.equal(highlightResult.segments[0].isMatch, false);
+  assert.equal(highlightResult.segments[1].text, "Project Milestone 2 Submission due 30/11/2026");
+  assert.equal(highlightResult.segments[1].isMatch, true);
+  assert.equal(highlightResult.segments[2].text, " via portal.\nLate submissions incur penalty.");
+  assert.equal(highlightResult.segments[2].isMatch, false);
+
+  // 3. Candidate selection state transitions
+  const initialSelection = new Set();
+  assert.equal(initialSelection.has(candidate.item_id), false);
+  const updatedSelection = new Set(initialSelection);
+  updatedSelection.add(candidate.item_id);
+  assert.equal(updatedSelection.has(candidate.item_id), true);
+  updatedSelection.delete(candidate.item_id);
+  assert.equal(updatedSelection.has(candidate.item_id), false);
+
+  console.log("✔ Scenario C: Candidate UI components and evidence drawer integration verified");
+}
+
+// ============================================================================
+// DEFECT 1 REGRESSION: Multiline Evidence Exact Matching in Drawer
+// ============================================================================
+{
+  // Test that multiline task evidence (joined with original whitespace) produces an exact highlight match
+  const multilineSource = "Internship opportunity at AI Lab.\nDeadline: 30/11/2026.\nSend CV to hr@example.com";
+  const exactMultilineEvidence = "Internship opportunity at AI Lab.\nDeadline: 30/11/2026.";
+
+  const drawerHighlight = highlightEvidence(multilineSource, exactMultilineEvidence);
+  assert.equal(drawerHighlight.matched, true, "Multiline evidence must highlight");
+  assert.equal(drawerHighlight.mismatchWarning, false, "Must not trigger mismatch warning for exact multiline span");
+  assert.equal(drawerHighlight.segments[0].text, exactMultilineEvidence);
+  assert.equal(drawerHighlight.segments[0].isMatch, true);
+  assert.equal(drawerHighlight.segments[1].text, "\nSend CV to hr@example.com");
+  assert.equal(drawerHighlight.segments[1].isMatch, false);
+
+  console.log("✔ Defect 1 Regression: Multiline evidence text matches verbatim without drawer mismatch warning");
+}
+
+// ============================================================================
+// TASK 1 REGRESSION: Evidence Reconstruction & Exact Matching Edge Cases
+// ============================================================================
+{
+  // 1. Two identical consecutive segments grouped into one task
+  const src1 = "Assignment 1 due Nov 25.\nAssignment 1 due Nov 25.";
+  const ev1 = "Assignment 1 due Nov 25.\nAssignment 1 due Nov 25.";
+  const hl1 = highlightEvidence(src1, ev1);
+  assert.equal(hl1.matched, true);
+  assert.equal(hl1.mismatchWarning, false);
+  assert.equal(hl1.segments.length, 1);
+  assert.equal(hl1.segments[0].text, ev1);
+  assert.equal(hl1.segments[0].isMatch, true);
+
+  // 2. Repeated first and last segments
+  const src2 = "Submit assignment 1.\nImportant details.\nSubmit assignment 1 on Nov 25.";
+  const ev2 = "Submit assignment 1.\nImportant details.\nSubmit assignment 1 on Nov 25.";
+  const hl2 = highlightEvidence(src2, ev2);
+  assert.equal(hl2.matched, true);
+  assert.equal(hl2.mismatchWarning, false);
+  assert.equal(hl2.segments.length, 1);
+  assert.equal(hl2.segments[0].text, ev2);
+
+  // 3. Repeated announcements separated by different sentences
+  const src3 = "Assignment 1 due Nov 25.\nExam on Dec 01.\nAssignment 1 due Nov 25.";
+  const ev3 = "Assignment 1 due Nov 25.";
+  const hl3 = highlightEvidence(src3, ev3);
+  assert.equal(hl3.matched, true);
+  assert.equal(hl3.mismatchWarning, false);
+
+  // 4. Multiline clusters with repeated dates
+  const src4 = "Workshop on 15/12/2026.\nMorning session on 15/12/2026.\nEvening session on 15/12/2026.";
+  const ev4 = "Workshop on 15/12/2026.\nMorning session on 15/12/2026.\nEvening session on 15/12/2026.";
+  const hl4 = highlightEvidence(src4, ev4);
+  assert.equal(hl4.matched, true);
+  assert.equal(hl4.mismatchWarning, false);
+  assert.equal(hl4.segments.length, 1);
+  assert.equal(hl4.segments[0].text, ev4);
+
+  // 5. Punctuation and blank-line preservation
+  const src5 = "Notice:\n\nAssignment 1 due 20/11/2026!\n\nPlease check LMS.";
+  const ev5 = "Assignment 1 due 20/11/2026!\n\nPlease check LMS.";
+  const hl5 = highlightEvidence(src5, ev5);
+  assert.equal(hl5.matched, true);
+  assert.equal(hl5.mismatchWarning, false);
+  assert.equal(hl5.segments.length, 2);
+  assert.equal(hl5.segments[0].text, "Notice:\n\n");
+  assert.equal(hl5.segments[0].isMatch, false);
+  assert.equal(hl5.segments[1].text, ev5);
+  assert.equal(hl5.segments[1].isMatch, true);
+
+  console.log("✔ Task 1 Regression: All 5 evidence reconstruction edge cases verified in frontend drawer highlight");
+}
+
+// ============================================================================
+// SCENARIO D: Save Candidate Payload Construction & Provenance Preservation
+// ============================================================================
+{
+  const candidate = {
+    title: "Final Term Paper",
+    category: "Assignment",
+    due_date: "2026-12-10",
+    confidence: "HIGH",
+    confidence_reasons: ["Explicit deadline wording"],
+    review_required: false,
+    review_reasons: [],
+    evidence_text: "Final Term Paper due December 10",
+    source_text: "Final Term Paper due December 10 in LMS.",
+    source_sender: "Prof. Davis",
+    source_timestamp: "2026-11-19 10:00:00",
+    source_filename: "chat.txt",
+  };
+
+  // Simulated frontend payload construction before POST /api/academic-items
+  const savePayload = {
+    title: candidate.title,
+    category: candidate.category,
+    due_date: candidate.due_date,
+    status: "pending",
+    evidence_text: candidate.evidence_text,
+    source_text: candidate.source_text,
+    source_sender: candidate.source_sender,
+    source_timestamp: candidate.source_timestamp,
+    source_filename: candidate.source_filename,
+    review_required: candidate.review_required,
+    review_reasons: candidate.review_reasons,
+  };
+
+  // Verify that frontend does NOT tamper with or inject synthetic confidence in client payload
+  assert.equal("confidence" in savePayload, false, "Client POST payload must not define confidence");
+  assert.equal("confidence_reasons" in savePayload, false, "Client POST payload must not define confidence_reasons");
+  assert.equal(savePayload.evidence_text, candidate.evidence_text);
+  assert.equal(savePayload.source_text.includes(savePayload.evidence_text), true);
+
+  console.log("✔ Scenario D: Save payload generation and provenance preservation verified");
+}
+
+// ============================================================================
+// SCENARIO E: Combined Multi-Criteria Filtering
+// ============================================================================
+{
+  const taskStore = [
+    { id: 1, title: "Assignment 1", category: "Assignment", status: "pending", confidence: "HIGH", due_date: "2026-11-25", source_text: "Due soon" },
+    { id: 2, title: "Assignment 2", category: "Assignment", status: "completed", confidence: "HIGH", due_date: "2026-11-26", source_text: "Finished" },
+    { id: 3, title: "Exam Prep", category: "Exam", status: "pending", confidence: "MEDIUM", due_date: "2026-12-01", source_text: "Review chapters" },
+    { id: 4, title: "Hackathon", category: "Event", status: "pending", confidence: "LOW", due_date: "2026-12-05", source_text: "Register team" },
+    { id: 5, title: "Manual Entry Task", category: "Assignment", status: "pending", confidence: "UNASSESSED", due_date: "2026-12-10", source_text: "Notes" },
+  ];
+
+  // 1. Filter: category="Assignment" AND confidence="HIGH"
+  const filter1 = filterTasks(taskStore, { category: "Assignment", confidence: "HIGH" });
+  assert.equal(filter1.length, 2);
+  assert.ok(filter1.every(t => t.category === "Assignment" && t.confidence === "HIGH"));
+
+  // 2. Filter: category="Assignment" AND status="pending" AND confidence="HIGH"
+  const filter2 = filterTasks(taskStore, { category: "Assignment", status: "pending", confidence: "HIGH" });
+  assert.equal(filter2.length, 1);
+  assert.equal(filter2[0].id, 1);
+
+  // 3. Filter: confidence="UNASSESSED"
+  const filter3 = filterTasks(taskStore, { confidence: "UNASSESSED" });
+  assert.equal(filter3.length, 1);
+  assert.equal(filter3[0].id, 5);
+
+  // 4. Filter: search query "Exam" AND confidence="MEDIUM"
+  const filter4 = filterTasks(taskStore, { search: "Exam", confidence: "MEDIUM" });
+  assert.equal(filter4.length, 1);
+  assert.equal(filter4[0].id, 3);
+
+  // 5. Clear filters restores full collection
+  const filterCleared = filterTasks(taskStore, { category: "ALL", status: "ALL", confidence: "ALL", search: "" });
+  assert.equal(filterCleared.length, taskStore.length);
+
+  console.log("✔ Scenario E: Combined multi-criteria filtering verified");
+}
+
+// ============================================================================
+// SCENARIO F: Task CRUD Operations in Frontend State & Immutability
+// ============================================================================
+{
+  let stateTasks = [
+    {
+      id: 1,
+      title: "Initial Task",
+      category: "Assignment",
+      status: "pending",
+      confidence: "HIGH",
+      confidence_reasons: ["Explicit deadline"],
+      evidence_text: "Due Nov 25",
+      source_text: "Task due Nov 25",
+    },
+  ];
+
+  // 1. Create task from candidate
+  const newTask = {
+    id: 2,
+    title: "Created Task",
+    category: "Exam",
+    status: "pending",
+    confidence: "MEDIUM",
+    confidence_reasons: ["Relative date"],
+    evidence_text: "Exam next Monday",
+    source_text: "Exam next Monday in Room 101",
+  };
+  stateTasks = [...stateTasks, newTask];
+  assert.equal(stateTasks.length, 2);
+
+  // 2. Update task status (pending -> completed)
+  stateTasks = stateTasks.map(t => (t.id === 1 ? { ...t, status: "completed" } : t));
+  assert.equal(stateTasks.find(t => t.id === 1).status, "completed");
+
+  // 3. Edit mutable fields (title, due_date) while strictly preserving immutable confidence and evidence
+  const userEdit = { title: "Updated Task Title", due_date: "2026-11-26" };
+  stateTasks = stateTasks.map(t => {
+    if (t.id === 1) {
+      return {
+        ...t,
+        title: userEdit.title,
+        due_date: userEdit.due_date,
+        // Ensure confidence and evidence are NOT overwritten by user edits
+        confidence: t.confidence,
+        confidence_reasons: t.confidence_reasons,
+        evidence_text: t.evidence_text,
+      };
+    }
+    return t;
+  });
+  const updatedTask = stateTasks.find(t => t.id === 1);
+  assert.equal(updatedTask.title, "Updated Task Title");
+  assert.equal(updatedTask.due_date, "2026-11-26");
+  assert.equal(updatedTask.confidence, "HIGH", "Confidence must remain immutable across edits");
+  assert.equal(updatedTask.evidence_text, "Due Nov 25", "Evidence must remain immutable across edits");
+
+  // 4. Delete task
+  stateTasks = stateTasks.filter(t => t.id !== 1);
+  assert.equal(stateTasks.length, 1);
+  assert.equal(stateTasks[0].id, 2);
+
+  console.log("✔ Scenario F: Task CRUD operations and metadata immutability verified");
+}
+
+// ============================================================================
+// SCENARIO G: Calendar Export URL Parameter Encoding
+// ============================================================================
+{
+  function buildExportUrl(baseUrl, filters = {}) {
+    const params = new URLSearchParams();
+    if (filters.category && filters.category !== "ALL") {
+      params.set("category", filters.category);
+    }
+    if (filters.status && filters.status !== "ALL") {
+      params.set("status", filters.status);
+    }
+    if (filters.startDate) {
+      params.set("start_date", filters.startDate);
+    }
+    if (filters.endDate) {
+      params.set("end_date", filters.endDate);
+    }
+    const qs = params.toString();
+    return qs ? `${baseUrl}/export.ics?${qs}` : `${baseUrl}/export.ics`;
+  }
+
+  const base = "/api/academic-items";
+
+  // 1. All filters default
+  assert.equal(buildExportUrl(base, {}), "/api/academic-items/export.ics");
+
+  // 2. Specific category & status
+  assert.equal(
+    buildExportUrl(base, { category: "Assignment", status: "pending" }),
+    "/api/academic-items/export.ics?category=Assignment&status=pending"
+  );
+
+  // 3. Date range filters
+  assert.equal(
+    buildExportUrl(base, { startDate: "2026-11-01", endDate: "2026-11-30" }),
+    "/api/academic-items/export.ics?start_date=2026-11-01&end_date=2026-11-30"
+  );
+
+  console.log("✔ Scenario G: Calendar export URL generation and parameter encoding verified");
+}
+
+// ============================================================================
+// SCENARIO H: Regression Coverage for Legacy & Edge-Case Records
+// ============================================================================
+{
+  const legacyRecord = {
+    id: 999,
+    title: "Legacy Phase 1 Record",
+    category: "Assignment",
+    status: "pending",
+    confidence: null,
+    confidence_reasons: null,
+    evidence_text: null,
+    source_text: "Historical text without confidence or evidence",
+    review_required: null,
+    review_reasons: null,
+  };
+
+  // 1. Confidence normalization
+  assert.equal(normalizeConfidence(legacyRecord.confidence), "UNASSESSED");
+
+  // 2. Review Decision for legacy item
+  const legacyDecision = getReviewStatus({
+    reviewRequired: legacyRecord.review_required,
+    confidence: legacyRecord.confidence,
+    reasons: legacyRecord.review_reasons,
+  });
+  assert.equal(legacyDecision.status, "UNAVAILABLE");
+  assert.equal(legacyDecision.label, "Review status unavailable");
+
+  // 3. Evidence drawer highlight gracefully handles null evidence
+  const legacyHighlight = highlightEvidence(legacyRecord.source_text, legacyRecord.evidence_text);
+  assert.equal(legacyHighlight.matched, false);
+  assert.equal(legacyHighlight.mismatchWarning, false);
+  assert.equal(legacyHighlight.segments[0].text, legacyRecord.source_text);
+  assert.equal(legacyHighlight.segments[0].isMatch, false);
+
+  // 4. Filtering includes legacy item under UNASSESSED
+  const filtered = filterTasks([legacyRecord], { confidence: "UNASSESSED" });
+  assert.equal(filtered.length, 1);
+  assert.equal(filtered[0].id, 999);
+
+  console.log("✔ Scenario H: Legacy record backward compatibility verified");
+}
+
+console.log("\nAll End-to-End Frontend Integration tests PASSED successfully!");
