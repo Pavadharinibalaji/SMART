@@ -30,6 +30,8 @@ IMMUTABLE_FIELDS = {
     "source_timestamp",
     "source_filename",
     "evidence_text",
+    "evidence_start_index",
+    "evidence_end_index",
     "confidence",
     "confidence_reasons",
     "created_at",
@@ -107,6 +109,8 @@ def init_db(db_path: Optional[Path | str] = None) -> None:
                 review_required INTEGER NOT NULL DEFAULT 0,
                 review_reasons TEXT,
                 evidence_text TEXT,
+                evidence_start_index INTEGER,
+                evidence_end_index INTEGER,
                 confidence TEXT DEFAULT 'MEDIUM',
                 confidence_reasons TEXT,
                 created_at TEXT NOT NULL,
@@ -121,6 +125,12 @@ def init_db(db_path: Optional[Path | str] = None) -> None:
 
         if "evidence_text" not in existing_cols:
             conn.execute("ALTER TABLE academic_items ADD COLUMN evidence_text TEXT;")
+
+        if "evidence_start_index" not in existing_cols:
+            conn.execute("ALTER TABLE academic_items ADD COLUMN evidence_start_index INTEGER;")
+
+        if "evidence_end_index" not in existing_cols:
+            conn.execute("ALTER TABLE academic_items ADD COLUMN evidence_end_index INTEGER;")
 
         if "confidence" not in existing_cols:
             conn.execute(
@@ -177,6 +187,16 @@ def row_to_item_dict(row: sqlite3.Row) -> dict[str, Any]:
     confidence = row["confidence"] if ("confidence" in row_keys and row["confidence"]) else "UNASSESSED"
     # Legacy rows without evidence_text remain None — not backfilled from source_text.
     evidence_text = row["evidence_text"] if ("evidence_text" in row_keys and row["evidence_text"]) else None
+    evidence_start_index = (
+        int(row["evidence_start_index"])
+        if ("evidence_start_index" in row_keys and row["evidence_start_index"] is not None)
+        else None
+    )
+    evidence_end_index = (
+        int(row["evidence_end_index"])
+        if ("evidence_end_index" in row_keys and row["evidence_end_index"] is not None)
+        else None
+    )
 
     return {
         "id": row["id"],
@@ -193,6 +213,8 @@ def row_to_item_dict(row: sqlite3.Row) -> dict[str, Any]:
         "source_text": row["source_text"],
         "source_filename": row["source_filename"] or "",
         "evidence_text": evidence_text,
+        "evidence_start_index": evidence_start_index,
+        "evidence_end_index": evidence_end_index,
         "confidence": confidence,
         "confidence_reasons": conf_reasons,
         "review_required": bool(row["review_required"]),
@@ -317,6 +339,37 @@ def save_academic_item(
     else:
         evidence_text = None
 
+    # evidence_start_index and evidence_end_index: occurrence offsets.
+    raw_start = data.get("evidence_start_index")
+    raw_end = data.get("evidence_end_index")
+    evidence_start_index: int | None = None
+    evidence_end_index: int | None = None
+
+    if raw_start is not None or raw_end is not None:
+        if raw_start is None or raw_end is None:
+            raise ValueError("Both evidence_start_index and evidence_end_index must be provided together.")
+        try:
+            s_idx = int(raw_start)
+            e_idx = int(raw_end)
+        except (ValueError, TypeError):
+            raise ValueError("evidence_start_index and evidence_end_index must be valid integers.")
+
+        if s_idx < 0 or e_idx < 0:
+            raise ValueError("Evidence offsets cannot be negative.")
+        if s_idx >= e_idx:
+            raise ValueError("evidence_start_index must be strictly less than evidence_end_index.")
+        if e_idx > len(source_text):
+            raise ValueError("evidence_end_index cannot exceed the length of source_text.")
+
+        target_slice = source_text[s_idx:e_idx]
+        if evidence_text and target_slice != evidence_text:
+            raise ValueError(
+                f"Evidence offsets ({s_idx}, {e_idx}) point to '{target_slice[:50]}', "
+                f"which does not match evidence_text '{evidence_text[:50]}'."
+            )
+        evidence_start_index = s_idx
+        evidence_end_index = e_idx
+
     # confidence and confidence_reasons: system-generated fields.
     # Extraction pipeline passes _trusted_confidence to store its calculated score.
     # Manual/client-created tasks receive UNASSESSED to distinguish them from scored records.
@@ -341,9 +394,10 @@ def save_academic_item(
         INSERT INTO academic_items (
             title, category, description, date_text, due_date, date_type,
             date_status, status, source_sender, source_timestamp, source_text,
-            source_filename, evidence_text, confidence, confidence_reasons,
-            review_required, review_reasons, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            source_filename, evidence_text, evidence_start_index, evidence_end_index,
+            confidence, confidence_reasons, review_required, review_reasons,
+            created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
     """
 
     with get_db_connection(db_path) as conn:
@@ -363,6 +417,8 @@ def save_academic_item(
                 source_text,
                 source_filename,
                 evidence_text,
+                evidence_start_index,
+                evidence_end_index,
                 confidence,
                 conf_reasons_str,
                 review_required,

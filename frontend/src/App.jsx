@@ -242,6 +242,10 @@ export default function App() {
         source_filename: filename || file?.name || "",
         review_required: candidate.review_required,
         review_reasons: candidate.review_reasons,
+        evidence_text: candidate.evidence_text,
+        evidence_start_index: candidate.evidence_start_index,
+        evidence_end_index: candidate.evidence_end_index,
+        candidate_token: candidate.candidate_token,
       };
 
       const saved = await saveAcademicItem(payload);

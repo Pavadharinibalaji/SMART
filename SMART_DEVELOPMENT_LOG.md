@@ -839,3 +839,180 @@ Conduct exhaustive, end-to-end integration testing across the complete SMART 2.0
 - **Git Check:**
   - `git diff --check`: 0 whitespace errors.
 
+---
+
+## Phase 3.3: Evidence Occurrence Disambiguation
+
+### 1. Objective & Scope
+Implement reliable evidence occurrence identification so that the Evidence Inspection Drawer highlights the exact source occurrence associated with an extracted academic task, even when identical or repeated phrases appear multiple times in the same source message. Ensure strict backward compatibility with existing legacy tasks and non-offset records.
+
+---
+
+### 2. Architecture & Implementation
+
+#### 2.1 Occurrence Metadata Representation
+- Selected exact, 0-based character offsets in `source_text`:
+  - `evidence_start_index`: Non-negative integer marking the first character of the evidence segment.
+  - `evidence_end_index`: Non-negative integer marking the exclusive end character (`source_text[start:end] == evidence_text`).
+- In `backend/extractor.py:extract_academic_items()`, offset tracking is computed during cluster span reconstruction. When multiple identical tasks appear in a single message, `current_text_offset` ensures each occurrence receives its distinct, strictly increasing span.
+
+#### 2.2 Database Additive Migration & Provenance Protection
+- Extended table `academic_items` with two nullable integer columns:
+  - `evidence_start_index INTEGER`
+  - `evidence_end_index INTEGER`
+- In `init_db()`, added automatic additive migrations via `ALTER TABLE academic_items ADD COLUMN ...` if columns do not exist.
+- Added `evidence_start_index` and `evidence_end_index` to `IMMUTABLE_FIELDS`. Attempting to modify them via PATCH or `update_academic_item` raises `ValueError` / HTTP 422 `extra_forbidden`.
+- In `save_academic_item()`, offsets are validated: non-negative, `start < end <= len(source_text)`, and `source_text[start:end] == evidence_text`.
+
+#### 2.3 Frontend Occurrence-Aware Highlighting
+- Updated `frontend/src/utils/highlightEvidence.js` to accept `(sourceText, evidenceText, startIndex, endIndex)` or `(sourceText, evidenceText, options)`.
+- Verified offsets partition `sourceText` at the exact occurrence, disambiguating repeated identical phrases.
+- If offsets are provided but invalid or mismatched, `mismatchWarning` is flagged without silently mis-highlighting the wrong occurrence.
+- If offsets are omitted (`null` / `undefined`), seamlessly falls back to `indexOf` for backward compatibility with legacy records.
+- Updated `EvidenceDrawer.jsx` to pass `item.evidence_start_index` and `item.evidence_end_index`.
+
+---
+
+### 3. Test & Verification Metrics
+
+- **Backend Integration & Unit Tests (`py -m pytest -v`):**
+  - **141 passed, 1 warning in 37.63s** (100% passing across all 5 test suites).
+  - `backend/tests/test_extractor.py`: 61 passed (+3 occurrence disambiguation tests).
+  - `backend/tests/test_persistence.py`: 53 passed (+5 offset storage, legacy null, validation, and immutability tests).
+  - `backend/tests/test_integration_e2e.py`: 11 passed.
+  - `backend/tests/test_parser.py`: 8 passed.
+  - `backend/tests/test_api.py`: 8 passed.
+- **Frontend Test Suite (`npm --prefix frontend test`):**
+  - **67 tests passing** across 4 suites:
+    - `highlightEvidence.test.mjs`: 22 passed (+10 occurrence disambiguation unit tests).
+    - `ReviewIndicator.test.mjs`: 22 passed.
+    - `confidenceFilter.test.mjs`: 15 passed.
+    - `integrationE2E.test.mjs`: 8 passed (including occurrence disambiguation integration tests).
+- **Frontend Code Quality:**
+  - `npm --prefix frontend run lint`: 0 errors, 0 warnings.
+  - `npm --prefix frontend run build`: Production client bundle generated in 735ms.
+- **Git Whitespace Check (`git diff --check`):** Clean (0 errors).
+
+---
+
+## Phase 3.3.1: Unicode Offset Compatibility & Provenance Integrity Verification
+
+### 1. Objective & Scope
+Verify and enforce coordinate compatibility and extraction provenance integrity across the full SMART 2.0 lifecycle:
+1. **Unicode Coordinate Compatibility:** Reconcile Python Unicode code-point indexing (`len("😀") == 1`) with JavaScript UTF-16 code-unit indexing (`"😀".length == 2`) to ensure emojis and non-BMP symbols do not cause coordinate misalignment, false mismatch warnings, or incorrect evidence slicing.
+2. **Provenance Integrity & Server Authority:** Enforce server-side authority over evidence occurrence metadata during candidate persistence, preventing clients from overriding pipeline occurrences or forging provenance for manual tasks.
+
+---
+
+### 2. Architecture & Implementation
+
+#### 2.1 Coordinate Convention & Frontend Translation (`highlightEvidence.js`)
+- **Canonical Convention:** Unicode code-point indexing is established as the canonical persistence and API contract (matching Python string slicing and SQLite `SUBSTR`).
+- **Code-Point to UTF-16 Converter:** Implemented `codePointToUtf16Offset(str, codePointIndex)` in `frontend/src/utils/highlightEvidence.js`:
+  - Iterates code points, identifying surrogate pairs (0xD800–0xDBFF and 0xDC00–0xDFFF) such as emojis (📢, 🚀, 💡, 📝, 🎯, 📚, 🏆, ⏰).
+  - Translates code-point offsets to exact UTF-16 code-unit indices.
+  - Handles bounds checking: returns `str.length` for end-of-string code points and `null` for out-of-bounds indices.
+- **Dual Matching Policy in Drawer:**
+  - Evaluates direct UTF-16 code-unit slice match first.
+  - Evaluates translated code-point slice match second.
+  - If offsets are provided but inconsistent or invalid, flags `mismatchWarning: true` without silently falling back to a different occurrence.
+  - If offsets are null/undefined (legacy records), safely falls back to `indexOf`.
+
+#### 2.2 Tamper-Evident Candidate Provenance Token (`extractor.py` & `main.py`)
+- **HMAC-SHA256 Token Engine (`backend/extractor.py`):**
+  - `create_candidate_token(candidate)`: Generates a signed token encapsulating `source_text`, `category`, `evidence_text`, `evidence_start_index`, `evidence_end_index`, `confidence`, and `confidence_reasons`.
+  - `verify_candidate_token(token)`: Validates signature and payload authenticity with `hmac.compare_digest`.
+  - Configurable via `SMART_PROVENANCE_SECRET` environment variable with secure fallback.
+- **Extraction Pipeline Integration:**
+  - `extract_academic_items()` generates `candidate_token` on every candidate dictionary returned to clients.
+- **Persistence Boundary Protection (`backend/main.py:create_academic_item`):**
+  - **Server-Side Authority:** When `candidate_token` is present, it is verified. If valid, the pipeline-certified metadata (`confidence`, `confidence_reasons`, `evidence_text`, `evidence_start_index`, `evidence_end_index`) is authoritatively applied to the persistent payload, completely overriding any client-supplied parameters.
+  - **Tamper Rejection:** Invalid, altered, or forged tokens are rejected with HTTP 400. Tokens with mismatched `source_text` are rejected with HTTP 400.
+  - **Fabrication Rejection:** Client requests providing `evidence_start_index` or `evidence_end_index` without a valid `candidate_token` are rejected with HTTP 400.
+  - **Manual Task Safety:** Legitimate manual tasks without a token receive `confidence: "UNASSESSED"`, empty `confidence_reasons`, and null offsets.
+- **Frontend Persistence Flow (`frontend/src/App.jsx`):**
+  - Updated `handleSaveCandidate` to pass `candidate_token`, `evidence_text`, `evidence_start_index`, and `evidence_end_index` to `POST /api/academic-items`.
+
+---
+
+### 3. Test & Verification Metrics
+
+- **Backend Pytest Suite (`py -m pytest -v`):**
+  - **152 passed, 1 warning in 19.63s** (100% passing across all 5 test suites).
+  - Added 6 new Unicode offset regression tests in `backend/tests/test_extractor.py`:
+    - `test_unicode_offsets_single_emoji_before_evidence`
+    - `test_unicode_offsets_multiple_emojis_before_evidence`
+    - `test_unicode_offsets_emoji_inside_evidence`
+    - `test_unicode_offsets_multiline_with_non_bmp_emojis`
+    - `test_unicode_offsets_mixed_ascii_emoji_and_punctuation`
+    - `test_candidate_token_generated_and_verifiable`
+  - Added 5 new provenance integrity regression tests in `backend/tests/test_persistence.py`:
+    - `test_persistence_candidate_token_overrides_client_supplied_offsets` (two identical phrases; client attempts to save with second occurrence offsets; server enforces first occurrence from token)
+    - `test_persistence_tampered_candidate_token_rejected` (HTTP 400)
+    - `test_persistence_token_with_mismatched_source_text_rejected` (HTTP 400)
+    - `test_persistence_offsets_without_token_rejected_for_manual_task` (HTTP 400)
+    - `test_persistence_candidate_token_restores_pipeline_provenance`
+- **Frontend Test Suite (`npm --prefix frontend test`):**
+  - **74 tests passing** across 4 suites:
+    - `highlightEvidence.test.mjs`: 28 passed (+6 Unicode offset compatibility tests: single emoji before evidence, multiple emojis before evidence, emoji inside evidence, multiline with non-BMP before/inside, mixed symbols/punctuation, legacy records without offsets).
+    - `ReviewIndicator.test.mjs`: 22 passed.
+    - `confidenceFilter.test.mjs`: 15 passed.
+    - `integrationE2E.test.mjs`: 9 passed (+Scenario I verifying Unicode compatibility, candidate save payload structure, and occurrence disambiguation).
+- **Frontend Code Quality:**
+  - `npm --prefix frontend run lint`: 0 errors, 0 warnings.
+  - `npm --prefix frontend run build`: Clean Vite production build in 663ms.
+- **Git Whitespace Check (`git diff --check`):** Clean (0 errors).
+
+---
+
+## Phase 3.3.2: Final Unicode & Cryptographic Provenance Audit
+
+### 1. Objective & Scope
+Perform an in-depth security and correctness audit of the Phase 3.3.1 implementation:
+1. **Unicode Occurrence Selection Audit:** Investigate whether checking direct UTF-16 code units prior to code-point translation introduces collision vulnerabilities when repeated phrases are preceded by emojis.
+2. **Cryptographic Provenance Audit:** Audit the HMAC-SHA256 candidate token engine for secure key configuration, constant-time verification, deterministic serialization, tampered/fabricated payload rejection, category restoration, backend restart behavior, and deduplication replay resistance.
+
+---
+
+### 2. Audit Findings & Implemented Corrections
+
+#### 2.1 Critical Finding: Direct UTF-16-First Matching is Unsafe
+- **Vulnerability Identified:** The API contract defines offsets as Python Unicode code-point positions. If JavaScript checks a direct `sourceText.slice(startIndex, endIndex)` before translating code points, a collision defect occurs when preceding non-BMP emojis shift UTF-16 indices by exactly the distance between identical occurrences.
+- **Proof-of-Concept Reproduction:** For `source = "🚀🔥💡🎉🎯Quiz Quiz"` with `prefix = 5 emojis` (5 code points, 10 UTF-16 units), Occurrence 2 is at Python code points 10..14. Direct UTF-16 slice `(10, 14)` matches Occurrence 1 (`source.slice(10, 14) === "Quiz"`), causing Occurrence 1 to be falsely highlighted instead of Occurrence 2.
+- **Correction Applied (`frontend/src/utils/highlightEvidence.js`):** Removed the unsafe direct UTF-16 pre-check. Offsets are now strictly translated via `codePointToUtf16Offset(sourceText, startIndex/endIndex)` as the authoritative coordinate convention. For ASCII/BMP text, code points equal UTF-16 units identically. Invalid or out-of-bounds offsets safely flag `mismatchWarning: true`.
+
+#### 2.2 HMAC Key Management & Process Lifecycle Security (`backend/extractor.py`)
+- **Key Resolution (`get_provenance_secret()`):**
+  - If `SMART_PROVENANCE_SECRET` is set in the environment and non-empty, uses its UTF-8 bytes.
+  - If `SMART_PROVENANCE_SECRET` is missing or empty, generates a cryptographically secure 32-byte key at runtime via `secrets.token_bytes(32)`. This prevents silent fallback to predictable repository defaults.
+- **Backend Restart Behavior:**
+  - When configured in environment: tokens remain verifiable across server restarts.
+  - When unconfigured: ephemeral runtime secret resets across restarts, safely invalidating old candidate tokens and preventing cross-deployment token forgery.
+
+#### 2.3 Trusted Metadata Override & Category Restoration (`backend/main.py`)
+- **Pre-Deduplication Restoration:** In `create_academic_item()`, candidate token verification and restoration of `category`, `confidence`, `confidence_reasons`, `evidence_text`, `evidence_start_index`, and `evidence_end_index` occurs *prior* to deduplication.
+- **Client Override Rejection:** If a client submits a valid token but attempts to alter `category` (e.g. changing an "Assignment" candidate to "Exam"), the backend authoritatively restores the certified category from the token.
+- **Replay Protection:** Candidate save requests are deduplicated by SQLite source provenance; replaying a valid token to create duplicate tasks is rejected with HTTP 409 Conflict.
+
+---
+
+### 3. Test & Verification Metrics
+
+- **Backend Pytest Suite (`py -m pytest -v`):**
+  - **156 passed, 1 warning in 28.07s** (100% passing across all 5 test suites).
+  - Added 4 new audit tests in `backend/tests/test_persistence.py`:
+    - `test_persistence_trusted_metadata_overrides_all_tampered_client_fields` (client attempts to tamper category, evidence, offsets, confidence; server restores token values)
+    - `test_persistence_duplicate_save_rejected_for_candidate_token` (HTTP 409 Conflict on candidate token replay)
+    - `test_hmac_missing_or_empty_secret_generates_random_key` (verifies `secrets.token_bytes(32)` runtime key)
+    - `test_hmac_token_behavior_across_backend_restarts` (persistent env secret vs ephemeral restart keys)
+- **Frontend Test Suite (`npm --prefix frontend test`):**
+  - **79 tests passing** across 4 suites:
+    - `highlightEvidence.test.mjs`: 33 passed (+5 new regression tests: emoji before two identical phrases, multiple non-BMP emojis before repeated evidence, repeated phrases with variable separation, code-point offset collision proof-of-concept, multiline repeated evidence with emojis).
+    - `ReviewIndicator.test.mjs`: 22 passed.
+    - `confidenceFilter.test.mjs`: 15 passed.
+    - `integrationE2E.test.mjs`: 9 passed.
+- **Frontend Code Quality:**
+  - `npm --prefix frontend run lint`: 0 errors, 0 warnings.
+  - `npm --prefix frontend run build`: Clean Vite build in 426ms.
+- **Git Whitespace Check (`git diff --check`):** Clean (0 errors).
+

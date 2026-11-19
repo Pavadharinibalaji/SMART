@@ -61,7 +61,12 @@ export default function EvidenceDrawer({ item, onClose }) {
     border: "#cbd5e1",
   };
 
-  const highlightResult = highlightEvidence(item.source_text, item.evidence_text);
+  const highlightResult = highlightEvidence(
+    item.source_text,
+    item.evidence_text,
+    item.evidence_start_index,
+    item.evidence_end_index
+  );
   const reasons = Array.isArray(item.confidence_reasons) ? item.confidence_reasons : [];
   const isUnassessed = (item.confidence || "").toUpperCase() === "UNASSESSED";
 

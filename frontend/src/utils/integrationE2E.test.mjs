@@ -221,6 +221,75 @@ console.log("Starting End-to-End Frontend Integration test suite...\n");
 }
 
 // ============================================================================
+// PHASE 3.3: Occurrence Disambiguation Integration Tests
+// ============================================================================
+{
+  const source = "Quiz on Friday.\nLab report due.\nQuiz on Friday.";
+  const candidate1 = {
+    item_id: 201,
+    title: "Quiz 1",
+    category: "Exam",
+    source_text: source,
+    evidence_text: "Quiz on Friday.",
+    evidence_start_index: 0,
+    evidence_end_index: 15,
+  };
+  const candidate2 = {
+    item_id: 202,
+    title: "Quiz 2",
+    category: "Exam",
+    source_text: source,
+    evidence_text: "Quiz on Friday.",
+    evidence_start_index: 32,
+    evidence_end_index: 47,
+  };
+
+  // Drawer highlight for candidate 1 matches first occurrence
+  const hl1 = highlightEvidence(
+    candidate1.source_text,
+    candidate1.evidence_text,
+    candidate1.evidence_start_index,
+    candidate1.evidence_end_index
+  );
+  assert.equal(hl1.matched, true);
+  assert.equal(hl1.segments[0].text, "Quiz on Friday.");
+  assert.equal(hl1.segments[0].isMatch, true);
+  assert.equal(hl1.segments[1].text, "\nLab report due.\nQuiz on Friday.");
+  assert.equal(hl1.segments[1].isMatch, false);
+
+  // Drawer highlight for candidate 2 matches second occurrence (exact disambiguation)
+  const hl2 = highlightEvidence(
+    candidate2.source_text,
+    candidate2.evidence_text,
+    candidate2.evidence_start_index,
+    candidate2.evidence_end_index
+  );
+  assert.equal(hl2.matched, true);
+  assert.equal(hl2.segments[0].text, "Quiz on Friday.\nLab report due.\n");
+  assert.equal(hl2.segments[0].isMatch, false);
+  assert.equal(hl2.segments[1].text, "Quiz on Friday.");
+  assert.equal(hl2.segments[1].isMatch, true);
+
+  // Persistence payload preserves occurrence offsets
+  const savePayload = {
+    title: candidate2.title,
+    category: candidate2.category,
+    source_text: candidate2.source_text,
+    evidence_text: candidate2.evidence_text,
+    evidence_start_index: candidate2.evidence_start_index,
+    evidence_end_index: candidate2.evidence_end_index,
+  };
+  assert.equal(savePayload.evidence_start_index, 32);
+  assert.equal(savePayload.evidence_end_index, 47);
+  assert.equal(
+    source.slice(savePayload.evidence_start_index, savePayload.evidence_end_index),
+    savePayload.evidence_text
+  );
+
+  console.log("✔ Phase 3.3: Occurrence disambiguation integration verified across candidate pairs and drawer rendering");
+}
+
+// ============================================================================
 // SCENARIO D: Save Candidate Payload Construction & Provenance Preservation
 // ============================================================================
 {
@@ -451,6 +520,86 @@ console.log("Starting End-to-End Frontend Integration test suite...\n");
   assert.equal(filtered[0].id, 999);
 
   console.log("✔ Scenario H: Legacy record backward compatibility verified");
+}
+
+// ============================================================================
+// SCENARIO I: Phase 3.3.1 Unicode Compatibility & Candidate Save Provenance
+// ============================================================================
+{
+  // 1. Candidate save payload includes candidate_token and occurrence offsets
+  const candidate = {
+    title: "Assignment 1",
+    category: "Assignment",
+    source_text: "📢 Assignment 1 is due tomorrow at 5pm.",
+    due_date: "2026-11-20",
+    date_text: "tomorrow",
+    date_type: "deadline",
+    date_status: "resolved",
+    source_sender: "Prof",
+    source_timestamp: "2026-11-19 10:00",
+    review_required: false,
+    review_reasons: [],
+    evidence_text: "Assignment 1 is due tomorrow at 5pm.",
+    evidence_start_index: 2, // Python code points (after '📢 ')
+    evidence_end_index: 38,
+    candidate_token: "eyJjYXRlZ29yeSI...signature",
+  };
+
+  const savePayload = {
+    title: candidate.title,
+    category: candidate.category,
+    description: candidate.source_text,
+    date_text: candidate.date_text,
+    due_date: candidate.due_date,
+    date_type: candidate.date_type,
+    date_status: candidate.date_status,
+    status: "pending",
+    source_sender: candidate.source_sender,
+    source_timestamp: candidate.source_timestamp,
+    source_text: candidate.source_text,
+    source_filename: "chat.txt",
+    review_required: candidate.review_required,
+    review_reasons: candidate.review_reasons,
+    evidence_text: candidate.evidence_text,
+    evidence_start_index: candidate.evidence_start_index,
+    evidence_end_index: candidate.evidence_end_index,
+    candidate_token: candidate.candidate_token,
+  };
+
+  assert.equal(savePayload.candidate_token, candidate.candidate_token);
+  assert.equal(savePayload.evidence_start_index, 2);
+  assert.equal(savePayload.evidence_end_index, 38);
+
+  // 2. Drawer highlighting with Python code-point offsets and emoji prefix
+  const hlEmoji = highlightEvidence(
+    candidate.source_text,
+    candidate.evidence_text,
+    candidate.evidence_start_index,
+    candidate.evidence_end_index
+  );
+  assert.equal(hlEmoji.matched, true);
+  assert.equal(hlEmoji.mismatchWarning, false);
+  assert.equal(hlEmoji.segments.length, 2);
+  assert.equal(hlEmoji.segments[0].text, "📢 ");
+  assert.equal(hlEmoji.segments[0].isMatch, false);
+  assert.equal(hlEmoji.segments[1].text, candidate.evidence_text);
+  assert.equal(hlEmoji.segments[1].isMatch, true);
+
+  // 3. Repeated occurrences disambiguation in drawer
+  const repeatedSource = "Quiz tomorrow. Important announcement: Quiz tomorrow.";
+  const phrase = "Quiz tomorrow.";
+  // Second occurrence
+  const secondStart = repeatedSource.lastIndexOf(phrase);
+  const secondEnd = secondStart + phrase.length;
+  const hlSecond = highlightEvidence(repeatedSource, phrase, secondStart, secondEnd);
+  assert.equal(hlSecond.matched, true);
+  assert.equal(hlSecond.segments.length, 2);
+  assert.equal(hlSecond.segments[0].text, "Quiz tomorrow. Important announcement: ");
+  assert.equal(hlSecond.segments[0].isMatch, false);
+  assert.equal(hlSecond.segments[1].text, phrase);
+  assert.equal(hlSecond.segments[1].isMatch, true);
+
+  console.log("✔ Scenario I: Unicode compatibility and candidate save provenance verified");
 }
 
 console.log("\nAll End-to-End Frontend Integration tests PASSED successfully!");

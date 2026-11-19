@@ -929,3 +929,262 @@ def test_evidence_reconstruction_punctuation_and_blank_line_preservation():
         assert it["evidence_text"] in it["source_text"]
     assert items[0]["evidence_text"] == "Notice:"
     assert items[1]["evidence_text"] == "Assignment 1 due 20/11/2026!\n\nPlease check LMS."
+
+
+# 44. Evidence occurrence disambiguation tests (Phase 3.3)
+def test_evidence_offsets_two_identical_phrases_assigned_to_different_tasks():
+    """Verify that two identical phrases in one message get distinct, disambiguated offsets."""
+    text = "Assignment 1 due Nov 25.\nExam on Dec 01.\nAssignment 1 due Nov 25."
+    messages = [
+        {
+            "message_id": 401,
+            "timestamp_text": "2026-11-01 10:00:00",
+            "sender": "Prof",
+            "text": text,
+        }
+    ]
+    items = extract_academic_items(messages)
+    assert len(items) == 3
+
+    # Task 1: First occurrence
+    assert items[0]["evidence_text"] == "Assignment 1 due Nov 25"
+    assert items[0]["evidence_start_index"] == 0
+    assert items[0]["evidence_end_index"] == 23
+    assert text[items[0]["evidence_start_index"]:items[0]["evidence_end_index"]] == items[0]["evidence_text"]
+
+    # Task 2: Middle exam
+    assert items[1]["evidence_text"] == "Exam on Dec 01"
+    assert items[1]["evidence_start_index"] == 25
+    assert items[1]["evidence_end_index"] == 39
+    assert text[items[1]["evidence_start_index"]:items[1]["evidence_end_index"]] == items[1]["evidence_text"]
+
+    # Task 3: Second occurrence of Assignment 1 (disambiguated by offset)
+    assert items[2]["evidence_text"] == "Assignment 1 due Nov 25."
+    assert items[2]["evidence_start_index"] == 41
+    assert items[2]["evidence_end_index"] == 65
+    assert text[items[2]["evidence_start_index"]:items[2]["evidence_end_index"]] == items[2]["evidence_text"]
+    assert items[0]["evidence_start_index"] != items[2]["evidence_start_index"]
+
+
+def test_evidence_offsets_three_identical_phrases_in_one_message():
+    """Verify offset behavior when three identical announcements appear in one message.
+
+    1. Grouped in one task: offsets encompass the full span across all 3 phrases.
+    2. Separated across multiple tasks: each occurrence receives distinct disambiguated offsets.
+    """
+    # 1. Three identical phrases grouped into a single task
+    text1 = "CN Quiz on Friday; CN Quiz on Friday; CN Quiz on Friday."
+    messages1 = [
+        {
+            "message_id": 402,
+            "timestamp_text": "2026-11-01 10:00:00",
+            "sender": "Prof",
+            "text": text1,
+        }
+    ]
+    items1 = extract_academic_items(messages1)
+    assert len(items1) == 1
+    assert items1[0]["evidence_start_index"] == 0
+    assert items1[0]["evidence_end_index"] == len(text1)
+    assert text1[items1[0]["evidence_start_index"]:items1[0]["evidence_end_index"]] == items1[0]["evidence_text"]
+
+    # 2. Three identical phrases split into 3 distinct tasks by intervening announcements
+    text2 = "CN Quiz on Friday.\nLab report due Monday.\nCN Quiz on Friday.\nMidterm on Tuesday.\nCN Quiz on Friday."
+    messages2 = [
+        {
+            "message_id": 403,
+            "timestamp_text": "2026-11-01 10:00:00",
+            "sender": "Prof",
+            "text": text2,
+        }
+    ]
+    items2 = extract_academic_items(messages2)
+    assert len(items2) == 5
+
+    # Filter the three quiz tasks
+    quizzes = [it for it in items2 if "CN Quiz on Friday" in it["title"]]
+    assert len(quizzes) == 3
+
+    # Verify that each quiz's offsets correctly map to its respective occurrence
+    for q in quizzes:
+        start = q["evidence_start_index"]
+        end = q["evidence_end_index"]
+        assert start is not None and end is not None
+        assert text2[start:end] == q["evidence_text"]
+
+    # Verify strictly increasing, non-overlapping offsets across all 3 occurrences
+    assert quizzes[0]["evidence_start_index"] == 0
+    assert quizzes[0]["evidence_end_index"] == 17
+
+    assert quizzes[1]["evidence_start_index"] == 42
+    assert quizzes[1]["evidence_end_index"] == 59
+
+    assert quizzes[2]["evidence_start_index"] == 81
+    assert quizzes[2]["evidence_end_index"] == 99
+
+    assert quizzes[0]["evidence_end_index"] < quizzes[1]["evidence_start_index"] < quizzes[2]["evidence_start_index"]
+
+
+def test_evidence_offsets_multiline_with_original_newlines_and_punctuation():
+    """Verify multiline task offsets precisely encompass newlines and punctuation."""
+    text = "Important Assignment 2:\nDue: 30/11/2026 at 5pm.\nPlease submit via LMS."
+    messages = [
+        {
+            "message_id": 403,
+            "timestamp_text": "2026-11-01 10:00:00",
+            "sender": "Prof",
+            "text": text,
+        }
+    ]
+    items = extract_academic_items(messages)
+    assert len(items) == 1
+    it = items[0]
+    start = it["evidence_start_index"]
+    end = it["evidence_end_index"]
+    assert start == 0
+    assert end == len(text)
+    assert text[start:end] == it["evidence_text"]
+
+
+# 404. Unicode offset compatibility: single emoji before evidence (Phase 3.3.1)
+def test_unicode_offsets_single_emoji_before_evidence():
+    """Verify code-point indexing precision when a non-BMP emoji precedes the evidence."""
+    text = "Event: Seminar 📢 on 20/11/2026. Assignment 1 is due on 25/11/2026."
+    messages = [
+        {
+            "message_id": 501,
+            "timestamp_text": "2026-11-01 10:00:00",
+            "sender": "Prof",
+            "text": text,
+        }
+    ]
+    items = extract_academic_items(messages)
+    assert len(items) == 2
+    it = items[1]
+    assert it["category"] == "Assignment"
+    start = it["evidence_start_index"]
+    end = it["evidence_end_index"]
+    assert start is not None and end is not None
+    assert text[start:end] == it["evidence_text"]
+    assert it["evidence_text"] == "Assignment 1 is due on 25/11/2026."
+    assert "📢" in text[:start]
+
+
+# 405. Unicode offset compatibility: multiple emojis before evidence (Phase 3.3.1)
+def test_unicode_offsets_multiple_emojis_before_evidence():
+    """Verify code-point indexing precision when multiple surrogate-pair emojis precede evidence."""
+    text = "Event: Fest 🚀🔥💡 on 20/11/2026. Assignment 1 is due on 25/11/2026."
+    messages = [
+        {
+            "message_id": 502,
+            "timestamp_text": "2026-11-01 10:00:00",
+            "sender": "Coordinator",
+            "text": text,
+        }
+    ]
+    items = extract_academic_items(messages)
+    assert len(items) == 2
+    it = items[1]
+    assert it["category"] == "Assignment"
+    start = it["evidence_start_index"]
+    end = it["evidence_end_index"]
+    assert start is not None and end is not None
+    assert text[start:end] == it["evidence_text"]
+    assert it["evidence_text"] == "Assignment 1 is due on 25/11/2026."
+    assert "🚀🔥💡" in text[:start]
+
+
+# 406. Unicode offset compatibility: emoji inside evidence (Phase 3.3.1)
+def test_unicode_offsets_emoji_inside_evidence():
+    """Verify code-point indexing when an emoji is contained directly within the evidence."""
+    text = "Important: Project 📚 submission deadline is 28/11/2026."
+    messages = [
+        {
+            "message_id": 503,
+            "timestamp_text": "2026-11-01 10:00:00",
+            "sender": "Prof",
+            "text": text,
+        }
+    ]
+    items = extract_academic_items(messages)
+    assert len(items) == 1
+    it = items[0]
+    start = it["evidence_start_index"]
+    end = it["evidence_end_index"]
+    assert text[start:end] == it["evidence_text"]
+    assert "📚" in it["evidence_text"]
+
+
+# 407. Unicode offset compatibility: non-BMP characters before and inside multiline evidence (Phase 3.3.1)
+def test_unicode_offsets_multiline_with_non_bmp_emojis():
+    """Verify multiline cluster evidence offsets with non-BMP characters before and inside."""
+    text = "Event: Hackathon 🏆\nDate: 20/11/2026.\nAssignment 📝 Part 1 is due on 22/11/2026.\nLate submissions will receive 0% penalty ⏰."
+    messages = [
+        {
+            "message_id": 504,
+            "timestamp_text": "2026-11-01 10:00:00",
+            "sender": "Prof",
+            "text": text,
+        }
+    ]
+    items = extract_academic_items(messages)
+    assert len(items) == 2
+    it = items[1]
+    assert it["category"] == "Assignment"
+    start = it["evidence_start_index"]
+    end = it["evidence_end_index"]
+    assert text[start:end] == it["evidence_text"]
+    assert "🏆" in text[:start]
+    assert "📝" in it["evidence_text"]
+    assert "⏰" in it["evidence_text"]
+
+
+# 408. Unicode offset compatibility: mixed ASCII, emoji, and punctuation (Phase 3.3.1)
+def test_unicode_offsets_mixed_ascii_emoji_and_punctuation():
+    """Verify exact offset preservation in complex messages with mixed symbols and punctuation."""
+    text = "!!! [URGENT] 🚨 >> Quiz #3: chapter 5 & 6 on 20/11/2026 << 🎯 !!!"
+    messages = [
+        {
+            "message_id": 505,
+            "timestamp_text": "2026-11-01 10:00:00",
+            "sender": "TA",
+            "text": text,
+        }
+    ]
+    items = extract_academic_items(messages)
+    assert len(items) == 1
+    it = items[0]
+    start = it["evidence_start_index"]
+    end = it["evidence_end_index"]
+    assert text[start:end] == it["evidence_text"]
+    assert "Quiz #3" in it["evidence_text"]
+
+
+# 409. Candidate token verification in extraction pipeline (Phase 3.3.1)
+def test_candidate_token_generated_and_verifiable():
+    """Verify that extract_academic_items generates signed candidate_tokens that verify cleanly."""
+    from extractor import verify_candidate_token
+
+    messages = [
+        {
+            "message_id": 506,
+            "timestamp_text": "2026-11-01 10:00:00",
+            "sender": "Prof",
+            "text": "Assignment 5 submission is on 2026-12-10.",
+        }
+    ]
+    items = extract_academic_items(messages)
+    assert len(items) == 1
+    it = items[0]
+    token = it.get("candidate_token")
+    assert token is not None and isinstance(token, str)
+
+    decoded = verify_candidate_token(token)
+    assert decoded is not None
+    assert decoded["source_text"] == it["source_text"]
+    assert decoded["category"] == it["category"]
+    assert decoded["evidence_text"] == it["evidence_text"]
+    assert decoded["evidence_start_index"] == it["evidence_start_index"]
+    assert decoded["evidence_end_index"] == it["evidence_end_index"]
+    assert decoded["confidence"] == it["confidence"]
+    assert decoded["confidence_reasons"] == it["confidence_reasons"]

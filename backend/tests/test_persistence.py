@@ -12,6 +12,7 @@ from database import (
     init_db,
     save_academic_item,
 )
+from extractor import extract_academic_items
 from main import app
 
 client = TestClient(app)
@@ -1484,3 +1485,422 @@ def test_phase3_deterministic_confidence_regression():
         assert results[0]["confidence_reasons"] == [
             "Unambiguous academic category with validated explicit calendar date."
         ]
+
+
+# 49. Evidence occurrence offsets stored and retrieved (Phase 3.3)
+def test_persistence_evidence_offsets_stored_and_retrieved(tmp_path):
+    """Verify that evidence_start_index and evidence_end_index are persisted and returned."""
+    db_path = tmp_path / "offsets.db"
+    init_db(db_path)
+
+    source = "Assignment 1 due Nov 25.\nAssignment 1 due Nov 25."
+    # Second occurrence offsets: 25 to 49
+    item = save_academic_item({
+        "title": "Assignment 1",
+        "category": "Assignment",
+        "source_text": source,
+        "evidence_text": "Assignment 1 due Nov 25.",
+        "evidence_start_index": 25,
+        "evidence_end_index": 49,
+        "_trusted_confidence": "HIGH",
+        "_trusted_evidence": True,
+    }, db_path=db_path)
+
+    assert item["evidence_start_index"] == 25
+    assert item["evidence_end_index"] == 49
+    assert source[item["evidence_start_index"]:item["evidence_end_index"]] == item["evidence_text"]
+
+
+# 50. Legacy records return None for offsets (Phase 3.3)
+def test_persistence_legacy_records_evidence_offsets_are_none(tmp_path):
+    """Verify that legacy records without offset columns return None."""
+    db_path = tmp_path / "legacy_offsets.db"
+    init_db(db_path)
+
+    with get_db_connection(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO academic_items (
+                title, category, source_text, confidence, created_at, updated_at
+            ) VALUES ('Legacy Item', 'Assignment', 'Source text', 'MEDIUM', '2026-10-01', '2026-10-01');
+            """
+        )
+        conn.commit()
+
+    from database import list_academic_items
+    items = list_academic_items(db_path=db_path)
+    assert len(items) == 1
+    assert items[0]["evidence_start_index"] is None
+    assert items[0]["evidence_end_index"] is None
+
+
+# 51. Negative or out-of-range offsets rejected (Phase 3.3)
+def test_persistence_invalid_negative_or_out_of_range_offsets_rejected(tmp_path):
+    """Verify ValueError is raised for invalid, negative, inverted, or out-of-range offsets."""
+    db_path = tmp_path / "invalid_offsets.db"
+    init_db(db_path)
+
+    base = {
+        "title": "Task",
+        "category": "Assignment",
+        "source_text": "Hello world",
+        "evidence_text": "world",
+    }
+
+    # Negative start
+    with pytest.raises(ValueError, match="negative"):
+        save_academic_item({**base, "evidence_start_index": -1, "evidence_end_index": 5}, db_path=db_path)
+
+    # Inverted offsets
+    with pytest.raises(ValueError, match="strictly less"):
+        save_academic_item({**base, "evidence_start_index": 8, "evidence_end_index": 4}, db_path=db_path)
+
+    # Out of range end
+    with pytest.raises(ValueError, match="exceed"):
+        save_academic_item({**base, "evidence_start_index": 0, "evidence_end_index": 999}, db_path=db_path)
+
+    # Inconsistent with evidence text
+    with pytest.raises(ValueError, match="does not match"):
+        save_academic_item({**base, "evidence_start_index": 0, "evidence_end_index": 5}, db_path=db_path)
+
+
+# 52. PATCH cannot modify evidence offsets (Phase 3.3)
+def test_persistence_patch_cannot_modify_evidence_offsets():
+    """Verify that PATCH requests cannot alter evidence_start_index or evidence_end_index."""
+    res = client.post(
+        "/api/academic-items",
+        json={
+            "title": "Immutable Offsets Task",
+            "category": "Assignment",
+            "source_text": "Exam announcement",
+        },
+    )
+    assert res.status_code == 201
+    item_id = res.json()["id"]
+
+    patch_start = client.patch(
+        f"/api/academic-items/{item_id}",
+        json={"evidence_start_index": 5},
+    )
+    assert patch_start.status_code == 422
+
+    patch_end = client.patch(
+        f"/api/academic-items/{item_id}",
+        json={"evidence_end_index": 10},
+    )
+    assert patch_end.status_code == 422
+
+
+# 53. update_academic_item rejects immutable evidence offsets directly (Phase 3.3)
+def test_persistence_update_academic_item_rejects_immutable_evidence_offsets(tmp_path):
+    """Verify that update_academic_item raises ValueError if offsets are updated."""
+    from database import update_academic_item
+    db_path = tmp_path / "immutable_direct.db"
+    init_db(db_path)
+
+    saved = save_academic_item({
+        "title": "Direct Task",
+        "category": "Assignment",
+        "source_text": "Sample text",
+    }, db_path=db_path)
+
+    with pytest.raises(ValueError, match="immutable provenance data"):
+        update_academic_item(saved["id"], {"evidence_start_index": 0}, db_path=db_path)
+
+    with pytest.raises(ValueError, match="immutable provenance data"):
+        update_academic_item(saved["id"], {"evidence_end_index": 5}, db_path=db_path)
+
+
+# 54. Occurrence disambiguation: server authority overrides client-supplied offsets (Phase 3.3.1)
+def test_persistence_candidate_token_overrides_client_supplied_offsets():
+    """Verify that client-supplied offsets cannot override extraction pipeline metadata.
+
+    When a message contains two identical phrases and a candidate is extracted
+    for the first occurrence, any client attempt to save with offsets pointing to the
+    second occurrence is overridden by the server-side authoritative candidate_token.
+    """
+    source = "Assignment 1 due Nov 25.\nExam on Dec 01.\nAssignment 1 due Nov 25."
+
+    # 1. Run extraction pipeline to obtain authentic candidates with tokens
+    candidates = extract_academic_items([
+        {
+            "message_id": 901,
+            "timestamp_text": "2026-11-01 09:00:00",
+            "sender": "Prof",
+            "text": source,
+        }
+    ])
+    assert len(candidates) == 3
+    cand0 = candidates[0]
+    cand2 = candidates[2]
+
+    # cand0 is the first occurrence (0 to 23)
+    assert cand0["evidence_start_index"] == 0
+    assert cand0["evidence_end_index"] == 23
+    assert cand0["candidate_token"] is not None
+
+    # cand2 is the second occurrence (41 to 65)
+    assert cand2["evidence_start_index"] == 41
+    assert cand2["evidence_end_index"] == 65
+
+    # 2. Client submits candidate 0, but tampers with the payload by sending cand2's offsets
+    tampered_payload = {
+        "title": cand0["title"],
+        "category": cand0["category"],
+        "source_text": cand0["source_text"],
+        "due_date": cand0["due_date"],
+        "date_type": cand0["date_type"],
+        "evidence_text": cand2["evidence_text"],
+        "evidence_start_index": cand2["evidence_start_index"],  # malicious client override (41)!
+        "evidence_end_index": cand2["evidence_end_index"],      # malicious client override (65)!
+        "candidate_token": cand0["candidate_token"],            # authentic token for occurrence 0!
+    }
+
+    save_res = client.post("/api/academic-items", json=tampered_payload)
+    assert save_res.status_code == 201
+    saved = save_res.json()
+
+    # 3. Assert server retained authoritative first occurrence selected by pipeline
+    assert saved["evidence_start_index"] == 0
+    assert saved["evidence_end_index"] == 23
+    assert source[saved["evidence_start_index"]:saved["evidence_end_index"]] == cand0["evidence_text"]
+
+
+# 55. Tampered candidate token rejected with HTTP 400 (Phase 3.3.1)
+def test_persistence_tampered_candidate_token_rejected():
+    """Verify that forged or modified candidate tokens are rejected with HTTP 400."""
+    candidates = extract_academic_items([
+        {
+            "message_id": 902,
+            "timestamp_text": "2026-11-01 09:00:00",
+            "sender": "Prof",
+            "text": "Assignment 2 is due 2026-11-25.",
+        }
+    ])
+    cand = candidates[0]
+    real_token = cand["candidate_token"]
+
+    # Tamper with token signature
+    parts = real_token.split(".")
+    tampered_token = f"{parts[0]}.{'0' * len(parts[1])}"
+
+    payload = {
+        "title": cand["title"],
+        "category": cand["category"],
+        "source_text": cand["source_text"],
+        "due_date": cand["due_date"],
+        "candidate_token": tampered_token,
+    }
+
+    res = client.post("/api/academic-items", json=payload)
+    assert res.status_code == 400
+    assert "Invalid or tampered candidate token" in res.json()["detail"]
+
+
+# 56. Candidate token with mismatched source_text rejected with HTTP 400 (Phase 3.3.1)
+def test_persistence_token_with_mismatched_source_text_rejected():
+    """Verify that a token created for message A cannot be used to save message B."""
+    candidates = extract_academic_items([
+        {
+            "message_id": 903,
+            "timestamp_text": "2026-11-01 09:00:00",
+            "sender": "Prof",
+            "text": "Assignment A is due 2026-11-25.",
+        }
+    ])
+    cand = candidates[0]
+
+    payload = {
+        "title": cand["title"],
+        "category": cand["category"],
+        "source_text": "Completely different source text for Assignment B",
+        "candidate_token": cand["candidate_token"],
+    }
+
+    res = client.post("/api/academic-items", json=payload)
+    assert res.status_code == 400
+    assert "Candidate token does not match item source text" in res.json()["detail"]
+
+
+# 57. Manual task creation with offsets without token rejected with HTTP 400 (Phase 3.3.1)
+def test_persistence_offsets_without_token_rejected_for_manual_task():
+    """Verify that clients cannot fabricate occurrence offsets for manual tasks without a valid token."""
+    payload = {
+        "title": "Manual Student Task",
+        "category": "Assignment",
+        "source_text": "Student created task description here.",
+        "evidence_start_index": 0,
+        "evidence_end_index": 7,
+    }
+
+    res = client.post("/api/academic-items", json=payload)
+    assert res.status_code == 400
+    assert "Evidence occurrence offsets cannot be provided without a valid extraction candidate token" in res.json()["detail"]
+
+
+# 58. Candidate saved with candidate_token restores full pipeline provenance (Phase 3.3.1)
+def test_persistence_candidate_token_restores_pipeline_provenance():
+    """Verify that saving with candidate_token persists authentic confidence and offsets."""
+    candidates = extract_academic_items([
+        {
+            "message_id": 904,
+            "timestamp_text": "2026-11-01 09:00:00",
+            "sender": "Prof",
+            "text": "Assignment 4 final submission is on 2026-12-05.",
+        }
+    ])
+    cand = candidates[0]
+
+    payload = {
+        "title": cand["title"],
+        "category": cand["category"],
+        "source_text": cand["source_text"],
+        "due_date": cand["due_date"],
+        "candidate_token": cand["candidate_token"],
+    }
+
+    res = client.post("/api/academic-items", json=payload)
+    assert res.status_code == 201
+    saved = res.json()
+
+    assert saved["confidence"] == cand["confidence"]
+    assert saved["confidence_reasons"] == cand["confidence_reasons"]
+    assert saved["evidence_text"] == cand["evidence_text"]
+    assert saved["evidence_start_index"] == cand["evidence_start_index"]
+    assert saved["evidence_end_index"] == cand["evidence_end_index"]
+
+
+# 59. Client attempts to alter all certified metadata; backend restores token values (Phase 3.3.2)
+def test_persistence_trusted_metadata_overrides_all_tampered_client_fields():
+    """Verify that when a client attempts to alter category, evidence, offsets, or confidence,
+    the backend authoritatively restores the certified values from the candidate token.
+    """
+    source = "Assignment: Final project report submission is due 2026-12-15."
+    candidates = extract_academic_items([
+        {
+            "message_id": 905,
+            "timestamp_text": "2026-11-01 09:00:00",
+            "sender": "Prof",
+            "text": source,
+        }
+    ])
+    cand = candidates[0]
+    assert cand["category"] == "Assignment"
+    assert cand["confidence"] == "HIGH"
+    assert cand["evidence_start_index"] is not None
+
+    # Client constructs malicious payload trying to alter every certified field:
+    tampered_payload = {
+        "title": "Legit Title",
+        "category": "Exam",  # Altered: Assignment -> Exam
+        "source_text": cand["source_text"],
+        "due_date": cand["due_date"],
+        "evidence_text": "project report submission is due",  # Altered substring
+        "evidence_start_index": 0,  # Altered offsets
+        "evidence_end_index": 10,
+        "confidence": "LOW",  # Client-supplied confidence (should be ignored)
+        "confidence_reasons": ["Client fabricated reason"],
+        "candidate_token": cand["candidate_token"],
+    }
+
+    save_res = client.post("/api/academic-items", json=tampered_payload)
+    assert save_res.status_code == 201
+    saved = save_res.json()
+
+    # Verify every certified field is authoritatively restored from candidate_token
+    assert saved["category"] == "Assignment"
+    assert saved["confidence"] == "HIGH"
+    assert saved["confidence_reasons"] == cand["confidence_reasons"]
+    assert saved["evidence_text"] == cand["evidence_text"]
+    assert saved["evidence_start_index"] == cand["evidence_start_index"]
+    assert saved["evidence_end_index"] == cand["evidence_end_index"]
+
+
+# 60. Duplicate save of the same valid candidate produces 409 Conflict (Phase 3.3.2)
+def test_persistence_duplicate_save_rejected_for_candidate_token():
+    """Verify deduplication prevents replaying or saving the same candidate twice."""
+    candidates = extract_academic_items([
+        {
+            "message_id": 906,
+            "timestamp_text": "2026-11-01 09:00:00",
+            "sender": "Prof",
+            "text": "Assignment 7 is due on 2026-12-20.",
+        }
+    ])
+    cand = candidates[0]
+    payload = {
+        "title": cand["title"],
+        "category": cand["category"],
+        "source_text": cand["source_text"],
+        "candidate_token": cand["candidate_token"],
+    }
+
+    res1 = client.post("/api/academic-items", json=payload)
+    assert res1.status_code == 201
+
+    # Second save attempt rejected with HTTP 409
+    res2 = client.post("/api/academic-items", json=payload)
+    assert res2.status_code == 409
+    assert "already been saved" in res2.json()["detail"]
+
+
+# 61. Missing secret does not use hardcoded secret; generates secure random bytes (Phase 3.3.2)
+def test_hmac_missing_or_empty_secret_generates_random_key(monkeypatch):
+    """Verify that when SMART_PROVENANCE_SECRET is missing or empty,
+    a secure random key is generated rather than using a predictable hardcoded key.
+    """
+    from extractor import get_provenance_secret
+    import extractor
+
+    # 1. Configured via env
+    monkeypatch.setenv("SMART_PROVENANCE_SECRET", "custom-audit-secret-12345")
+    secret_configured = get_provenance_secret()
+    assert secret_configured == b"custom-audit-secret-12345"
+
+    # 2. Missing / empty env
+    monkeypatch.delenv("SMART_PROVENANCE_SECRET", raising=False)
+    extractor._RUNTIME_PROVENANCE_SECRET = None
+    secret_runtime1 = get_provenance_secret()
+    assert isinstance(secret_runtime1, bytes)
+    assert len(secret_runtime1) == 32
+    # Must NOT equal any predictable string
+    assert secret_runtime1 != b"smart-v2-academic-intelligence-secret-key-salt"
+    assert secret_runtime1 != b""
+
+    # Same process lifetime reuses the runtime secret
+    secret_runtime2 = get_provenance_secret()
+    assert secret_runtime1 == secret_runtime2
+
+
+# 62. Token behavior across backend restarts (Phase 3.3.2)
+def test_hmac_token_behavior_across_backend_restarts(monkeypatch):
+    """Verify token lifecycle across simulated backend restarts.
+    - With persistent SMART_PROVENANCE_SECRET in env: tokens remain valid.
+    - Without env secret (random runtime keys): tokens from process 1 are invalid in process 2.
+    """
+    import extractor
+    from extractor import create_candidate_token, verify_candidate_token
+
+    sample_cand = {
+        "source_text": "Restart test message",
+        "category": "Exam",
+        "confidence": "HIGH",
+    }
+
+    # Scenario A: Persistent secret configured in env
+    monkeypatch.setenv("SMART_PROVENANCE_SECRET", "stable-persistent-secret")
+    token_proc1 = create_candidate_token(sample_cand)
+    # Simulate restart with same env secret
+    verified_proc2 = verify_candidate_token(token_proc1)
+    assert verified_proc2 is not None
+    assert verified_proc2["source_text"] == "Restart test message"
+
+    # Scenario B: Unconfigured secret (ephemeral random runtime key per restart)
+    monkeypatch.delenv("SMART_PROVENANCE_SECRET", raising=False)
+    extractor._RUNTIME_PROVENANCE_SECRET = None
+    ephemeral_token = create_candidate_token(sample_cand)
+    assert verify_candidate_token(ephemeral_token) is not None
+
+    # Simulate process restart with fresh random key
+    extractor._RUNTIME_PROVENANCE_SECRET = None
+    assert verify_candidate_token(ephemeral_token) is None

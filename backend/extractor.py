@@ -8,10 +8,87 @@ and source evidence preservation.
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
+import json
+import os
 import re
+import secrets
 from datetime import date, datetime, timedelta
 from typing import Any
 from urllib.parse import urlparse
+
+# Provenance signing secret (configurable via env; random secure key generated on startup if omitted)
+_RUNTIME_PROVENANCE_SECRET: bytes | None = None
+
+
+def get_provenance_secret() -> bytes:
+    """Return the active HMAC secret for candidate provenance tokens.
+
+    1. Checks the SMART_PROVENANCE_SECRET environment variable. If set and non-empty,
+       uses its UTF-8 encoded bytes.
+    2. If SMART_PROVENANCE_SECRET is missing or empty, generates a cryptographically
+       secure 32-byte random key for the current process runtime (secrets.token_bytes(32))
+       instead of falling back to any predictable hardcoded key.
+    """
+    global _RUNTIME_PROVENANCE_SECRET
+    env_secret = os.environ.get("SMART_PROVENANCE_SECRET", "").strip()
+    if env_secret:
+        return env_secret.encode("utf-8")
+    if _RUNTIME_PROVENANCE_SECRET is None:
+        _RUNTIME_PROVENANCE_SECRET = secrets.token_bytes(32)
+    return _RUNTIME_PROVENANCE_SECRET
+
+
+def create_candidate_token(candidate: dict[str, Any]) -> str:
+    """Create a tamper-evident HMAC-SHA256 token certifying candidate extraction provenance.
+
+    Binds the authoritative source_text, category, evidence_text, evidence_start_index,
+    evidence_end_index, confidence, and confidence_reasons.
+    """
+    provenance_data = {
+        "source_text": candidate.get("source_text", ""),
+        "category": candidate.get("category", ""),
+        "evidence_text": candidate.get("evidence_text"),
+        "evidence_start_index": candidate.get("evidence_start_index"),
+        "evidence_end_index": candidate.get("evidence_end_index"),
+        "confidence": candidate.get("confidence", "UNASSESSED"),
+        "confidence_reasons": candidate.get("confidence_reasons") or [],
+    }
+    raw_json = json.dumps(provenance_data, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    payload_b64 = base64.urlsafe_b64encode(raw_json).decode("ascii")
+    secret = get_provenance_secret()
+    sig = hmac.new(secret, raw_json, hashlib.sha256).hexdigest()
+    return f"{payload_b64}.{sig}"
+
+
+def verify_candidate_token(token: str) -> dict[str, Any] | None:
+    """Verify candidate token authenticity and signature.
+
+    Returns the decoded provenance dictionary if valid, or None if invalid or tampered.
+    """
+    if not token or not isinstance(token, str) or "." not in token:
+        return None
+    parts = token.split(".", 1)
+    if len(parts) != 2:
+        return None
+    payload_b64, sig = parts
+    try:
+        raw_json = base64.urlsafe_b64decode(payload_b64.encode("ascii"))
+    except Exception:
+        return None
+    secret = get_provenance_secret()
+    expected_sig = hmac.new(secret, raw_json, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(sig, expected_sig):
+        return None
+    try:
+        data = json.loads(raw_json.decode("utf-8"))
+        if not isinstance(data, dict):
+            return None
+        return data
+    except Exception:
+        return None
 
 # Categories and their word-boundary patterns to prevent substring false positives
 # (e.g. 'eventually' matching 'event', 'example' matching 'exam', 'quizzical' matching 'quiz').
@@ -973,12 +1050,23 @@ def extract_academic_items(messages: list[dict[str, Any]]) -> list[dict[str, Any
                     search_pos = end_pos
 
                 if all_found and start_pos != -1 and end_pos != -1:
-                    cluster_text = text[start_pos:end_pos].strip()
+                    raw_span = text[start_pos:end_pos]
+                    leading_ws = len(raw_span) - len(raw_span.lstrip())
+                    trailing_ws = len(raw_span) - len(raw_span.rstrip())
+                    ev_start = start_pos + leading_ws
+                    ev_end = end_pos - trailing_ws
+                    cluster_text = text[ev_start:ev_end]
                     current_text_offset = end_pos
+                    evidence_start_index = ev_start
+                    evidence_end_index = ev_end
                 else:
                     cluster_text = " ".join(cluster).strip()
+                    evidence_start_index = None
+                    evidence_end_index = None
             else:
                 cluster_text = ""
+                evidence_start_index = None
+                evidence_end_index = None
             category, all_matched_cats = classify_message(cluster_text)
             if category is None:
                 category = msg_category
@@ -1056,7 +1144,7 @@ def extract_academic_items(messages: list[dict[str, Any]]) -> list[dict[str, Any
             lines = [l.strip() for l in cluster if l.strip()]
             title = lines[0][:120].strip() if lines else cluster_text[:120].strip()
 
-            items.append({
+            item = {
                 "item_id": message.get("message_id", len(items) + 1),
                 "category": category,
                 "title": title or "Untitled candidate message",
@@ -1068,6 +1156,8 @@ def extract_academic_items(messages: list[dict[str, Any]]) -> list[dict[str, Any
                 "deadline_time": time_info["deadline_time"],
                 "urls": urls,
                 "evidence_text": cluster_text,
+                "evidence_start_index": evidence_start_index,
+                "evidence_end_index": evidence_end_index,
                 "confidence": confidence,
                 "confidence_reasons": confidence_reasons,
                 "source_message_id": message.get("message_id"),
@@ -1078,6 +1168,8 @@ def extract_academic_items(messages: list[dict[str, Any]]) -> list[dict[str, Any
                 "extraction_method": "rules",
                 "review_required": review_required,
                 "review_reasons": review_reasons,
-            })
+            }
+            item["candidate_token"] = create_candidate_token(item)
+            items.append(item)
 
     return items

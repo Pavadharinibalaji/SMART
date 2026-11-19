@@ -30,7 +30,7 @@ from database import (
     update_academic_item,
     update_academic_item_status,
 )
-from extractor import extract_academic_items
+from extractor import create_candidate_token, extract_academic_items, verify_candidate_token
 from parser import parse_whatsapp_text
 
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB upload limit
@@ -99,9 +99,13 @@ class AcademicItemCreate(BaseModel):
     source_timestamp: Optional[str] = None
     source_text: str = Field(..., min_length=1)
     source_filename: Optional[str] = None
+    # Extraction candidate provenance token (HMAC-signed by extraction pipeline).
+    candidate_token: Optional[str] = None
     # evidence_text is accepted from clients but validated as a substring of source_text.
     # Arbitrary fabricated evidence is rejected by save_academic_item.
     evidence_text: Optional[str] = None
+    evidence_start_index: Optional[int] = None
+    evidence_end_index: Optional[int] = None
     # NOTE: confidence and confidence_reasons are intentionally excluded from this schema.
     # Client-supplied confidence assertions are not trusted. The persistence layer assigns
     # UNASSESSED to all manually created items. Only the extraction pipeline may supply
@@ -313,11 +317,53 @@ def create_academic_item(item: AcademicItemCreate) -> dict[str, Any]:
 
     Deduplicates based on source provenance to avoid accidental re-saves.
     """
-    clean_cat = item.category.strip()
+    payload = item.model_dump()
+    trusted_category = None
+
+    # Provenance Integrity Enforcement (Phase 3.3.1 / Phase 3.3.2):
+    if item.candidate_token:
+        token_data = verify_candidate_token(item.candidate_token)
+        if not token_data:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid or tampered candidate token.",
+            )
+        if token_data.get("source_text") != item.source_text:
+            raise HTTPException(
+                status_code=400,
+                detail="Candidate token does not match item source text.",
+            )
+
+        # Enforce pipeline-certified metadata from signed token,
+        # authoritatively overriding any client-supplied parameters.
+        payload["_trusted_confidence"] = token_data.get("confidence", "UNASSESSED")
+        payload["_trusted_confidence_reasons"] = token_data.get("confidence_reasons") or []
+        payload["_trusted_evidence"] = True
+        payload["evidence_text"] = token_data.get("evidence_text")
+        payload["evidence_start_index"] = token_data.get("evidence_start_index")
+        payload["evidence_end_index"] = token_data.get("evidence_end_index")
+        if token_data.get("category"):
+            trusted_category = token_data["category"]
+            payload["category"] = trusted_category
+    else:
+        # Offsets without a valid extraction candidate token represent fabricated provenance
+        if item.evidence_start_index is not None or item.evidence_end_index is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="Evidence occurrence offsets cannot be provided without a valid extraction candidate token.",
+            )
+        # Manual task creation without token: confidence is UNASSESSED, offsets are None
+        payload["_trusted_confidence"] = "UNASSESSED"
+        payload["_trusted_confidence_reasons"] = []
+        payload["evidence_start_index"] = None
+        payload["evidence_end_index"] = None
+
+    effective_cat = trusted_category or item.category
+    clean_cat = effective_cat.strip()
     if clean_cat not in ALLOWED_CATEGORIES:
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid category '{item.category}'. Allowed categories: {', '.join(sorted(ALLOWED_CATEGORIES))}",
+            detail=f"Invalid category '{clean_cat}'. Allowed categories: {', '.join(sorted(ALLOWED_CATEGORIES))}",
         )
 
     clean_status = (item.status or "pending").strip().lower()
@@ -341,11 +387,6 @@ def create_academic_item(item: AcademicItemCreate) -> dict[str, Any]:
             detail=f"Academic item has already been saved (Task #{existing['id']}).",
         )
 
-    payload = item.model_dump()
-    # NOTE: confidence and confidence_reasons are NOT present on AcademicItemCreate.
-    # Manually created items are persisted as UNASSESSED by save_academic_item().
-    # The extraction pipeline saves items via _save_extraction_candidate() which
-    # injects _trusted_confidence and _trusted_evidence into the payload.
     try:
         saved = save_academic_item(payload)
         return saved
