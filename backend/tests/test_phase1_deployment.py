@@ -306,3 +306,49 @@ def test_health_endpoints_database_failure(client):
         resp_live = client.get("/api/health/live")
         assert resp_live.status_code == 200
         assert resp_live.json() == {"status": "alive"}
+
+
+def test_get_frontend_url_development_default(monkeypatch):
+    """In development mode, get_frontend_url defaults to localhost:5173."""
+    from config import get_frontend_url
+    monkeypatch.delenv("SMART_FRONTEND_URL", raising=False)
+    monkeypatch.setenv("SMART_ENV", "development")
+    assert get_frontend_url() == "http://localhost:5173"
+
+
+def test_get_frontend_url_production_from_cors_origins(monkeypatch):
+    """In production mode, get_frontend_url extracts the primary HTTPS origin from CORS_ORIGINS."""
+    from config import get_frontend_url
+    monkeypatch.delenv("SMART_FRONTEND_URL", raising=False)
+    monkeypatch.setenv("SMART_ENV", "production")
+    monkeypatch.setenv("CORS_ORIGINS", "https://smart-academic-lake.vercel.app,https://smart-preview.vercel.app")
+    assert get_frontend_url() == "https://smart-academic-lake.vercel.app"
+
+
+def test_get_frontend_url_explicit_override(monkeypatch):
+    """SMART_FRONTEND_URL overrides CORS_ORIGINS in both development and production."""
+    from config import get_frontend_url
+    monkeypatch.setenv("SMART_ENV", "production")
+    monkeypatch.setenv("CORS_ORIGINS", "https://other-domain.com")
+    monkeypatch.setenv("SMART_FRONTEND_URL", "https://custom-smart.vercel.app/")
+    # Trailing slashes must be stripped
+    assert get_frontend_url() == "https://custom-smart.vercel.app"
+
+
+def test_google_oauth_callback_redirects_to_production_frontend(client, monkeypatch):
+    """Google OAuth callback error and missing params redirect to the production frontend URL."""
+    monkeypatch.setenv("SMART_ENV", "production")
+    monkeypatch.setenv("CORS_ORIGINS", "https://smart-academic-lake.vercel.app")
+    monkeypatch.delenv("SMART_FRONTEND_URL", raising=False)
+
+    # 1. Error callback redirect
+    res_err = client.get("/api/auth/google/callback?error=access_denied", follow_redirects=False)
+    assert res_err.status_code == 307
+    location_err = res_err.headers.get("location", "")
+    assert location_err.startswith("https://smart-academic-lake.vercel.app/?google_auth_error=")
+
+    # 2. Missing params callback redirect
+    res_miss = client.get("/api/auth/google/callback", follow_redirects=False)
+    assert res_miss.status_code == 307
+    location_miss = res_miss.headers.get("location", "")
+    assert location_miss.startswith("https://smart-academic-lake.vercel.app/?google_auth_error=")

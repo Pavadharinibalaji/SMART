@@ -92,6 +92,28 @@ def get_cors_origins() -> list[str]:
     return combined
 
 
+def get_frontend_url() -> str:
+    """Retrieve the primary frontend URL for post-authentication redirects.
+
+    Resolution order:
+    1. SMART_FRONTEND_URL environment variable if set.
+    2. In production, first HTTPS origin from CORS_ORIGINS.
+    3. In development, fallback to default local frontend URL ('http://localhost:5173').
+    """
+    custom_url = os.environ.get("SMART_FRONTEND_URL", "").strip()
+    if custom_url:
+        return custom_url.rstrip("/")
+
+    if is_production():
+        raw_cors = os.environ.get("CORS_ORIGINS", "").strip()
+        for part in raw_cors.split(","):
+            origin = part.strip()
+            if origin.startswith("https://"):
+                return origin.rstrip("/")
+
+    return "http://localhost:5173"
+
+
 def get_cookie_settings() -> dict[str, Any]:
     """Retrieve secure session cookie configuration.
     

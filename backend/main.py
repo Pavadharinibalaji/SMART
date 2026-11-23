@@ -11,6 +11,7 @@ import config  # Ensures root .env is loaded before accessing environment variab
 from config import (
     get_cookie_settings,
     get_cors_origins,
+    get_frontend_url,
     is_demo_login_allowed,
     is_production,
     validate_production_config,
@@ -1158,7 +1159,17 @@ def login_user(payload: LoginRequest, response: Response) -> dict[str, Any]:
         )
 
     # In production, check if demo accounts are permitted
-    if user.get("is_demo") and not is_demo_login_allowed():
+    raw_allow_demo = os.environ.get("ALLOW_DEMO_LOGINS", "").strip().lower()
+    demo_explicitly_allowed = raw_allow_demo in ("1", "true", "yes")
+    demo_explicitly_disallowed = raw_allow_demo in ("0", "false", "no")
+    is_prod = IS_PRODUCTION or is_production()
+
+    if user.get("is_demo") and is_prod and not demo_explicitly_allowed:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Demo authentication identities are disabled in production environments.",
+        )
+    if user.get("is_demo") and demo_explicitly_disallowed:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Demo authentication identities are disabled in production environments.",
@@ -1318,7 +1329,7 @@ async def handle_google_oauth_callback(
     In browser flow, redirects back to the frontend workspace at http://localhost:5173 with status query param.
     If raw=True or request asks for application/json without HTML, returns JSON.
     """
-    frontend_base = os.environ.get("SMART_FRONTEND_URL", "http://localhost:5173").rstrip("/")
+    frontend_base = get_frontend_url()
 
     if error:
         err_msg = f"Google OAuth authorization was denied or failed: {error}"
