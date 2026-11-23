@@ -14,6 +14,8 @@ import secrets
 import sqlite3
 from typing import Any, Optional
 
+from db_engine import create_db_connection, get_engine_type
+
 from prioritization import (
     ALLOWED_IMPORTANCE_LEVELS,
     ALLOWED_PRIORITY_LEVELS,
@@ -92,20 +94,36 @@ def is_valid_iso_date(val: Optional[str]) -> bool:
         return False
 
 
-def get_db_connection(db_path: Optional[Path | str] = None) -> sqlite3.Connection:
-    """Create and configure a SQLite database connection with row factory."""
-    resolved_path = Path(db_path) if db_path else get_db_path()
-    resolved_path.parent.mkdir(parents=True, exist_ok=True)
-
-    conn = sqlite3.connect(str(resolved_path), timeout=15.0)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON;")
-    conn.execute("PRAGMA journal_mode = WAL;")
-    return conn
+def get_db_connection(db_path: Optional[Path | str] = None) -> Any:
+    """Create and configure database connection facade (SQLite or PostgreSQL)."""
+    return create_db_connection(db_path=db_path, timeout=15.0)
 
 
 def init_db(db_path: Optional[Path | str] = None) -> None:
     """Safely initialize the academic items schema and apply additive migrations."""
+    if get_engine_type() == "postgresql":
+        schema_file = Path(__file__).resolve().parent / "schema_postgres.sql"
+        if schema_file.exists():
+            with get_db_connection(db_path) as conn:
+                with open(schema_file, "r", encoding="utf-8") as f:
+                    ddl_script = f.read()
+                statements = [s.strip() for s in ddl_script.split(";") if s.strip()]
+                for stmt in statements:
+                    conn.execute(stmt + ";")
+                now_iso = datetime.now(timezone.utc).isoformat()
+                for mig in [
+                    "smart_2_1_auth_tables",
+                    "smart_3_0_collaboration",
+                    "smart_3_1_materials",
+                    "smart_3_2_opportunities",
+                ]:
+                    conn.execute(
+                        "INSERT INTO schema_migrations (migration_name, applied_at) VALUES (?, ?) ON CONFLICT (migration_name) DO NOTHING;",
+                        (mig, now_iso),
+                    )
+                conn.commit()
+        return
+
     resolved_path = Path(db_path) if db_path else get_db_path()
     resolved_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -3382,7 +3400,9 @@ def enroll_student_by_join_code(
 
         if existing:
             if existing["status"] == "enrolled":
-                return dict(course)
+                res = dict(course)
+                res["status"] = "already_enrolled"
+                return res
             conn.execute(
                 "UPDATE course_memberships SET status = 'enrolled', joined_at = ? WHERE id = ?;",
                 (now_iso, existing["id"]),
@@ -3407,7 +3427,9 @@ def enroll_student_by_join_code(
         )
 
         conn.commit()
-        return dict(course)
+        res = dict(course)
+        res["status"] = "enrolled"
+        return res
 
 
 def remove_student_from_course(

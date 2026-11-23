@@ -85,7 +85,13 @@ def build_authorization_url(
 ) -> dict[str, Any]:
     """Generate the Google OAuth 2.0 authorization URL with CSRF state token."""
     client_id, _ = get_oauth_credentials()
-    clean_redirect = (redirect_uri or os.environ.get("GOOGLE_REDIRECT_URI", "http://localhost:8000/api/auth/google/callback")).strip()
+    clean_redirect = (redirect_uri or os.environ.get("GOOGLE_REDIRECT_URI", "")).strip()
+    smart_env = os.environ.get("SMART_ENV", "development").strip().lower()
+
+    if not clean_redirect:
+        if smart_env == "production":
+            raise ValueError("Production configuration error: GOOGLE_REDIRECT_URI is required in production environments.")
+        clean_redirect = "http://localhost:8000/api/auth/google/callback"
 
     if not client_id:
         return {
@@ -123,7 +129,12 @@ async def exchange_code_for_tokens(code: str, state: str) -> dict[str, Any]:
     if not client_id or not client_secret:
         raise ValueError("Google OAuth credentials are not configured on the server.")
 
-    redirect_uri = state_payload.get("redirect_uri") or os.environ.get("GOOGLE_REDIRECT_URI", "http://localhost:8000/api/auth/google/callback")
+    redirect_uri = (state_payload.get("redirect_uri") or os.environ.get("GOOGLE_REDIRECT_URI", "")).strip()
+    smart_env = os.environ.get("SMART_ENV", "development").strip().lower()
+    if not redirect_uri:
+        if smart_env == "production":
+            raise ValueError("Production configuration error: GOOGLE_REDIRECT_URI is required in production environments.")
+        redirect_uri = "http://localhost:8000/api/auth/google/callback"
     role = state_payload.get("role", "student")
 
     async with httpx.AsyncClient(timeout=15.0) as client:

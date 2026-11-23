@@ -8,6 +8,13 @@ RFC 5545 iCalendar export.
 from __future__ import annotations
 
 import config  # Ensures root .env is loaded before accessing environment variables
+from config import (
+    get_cookie_settings,
+    get_cors_origins,
+    is_demo_login_allowed,
+    is_production,
+    validate_production_config,
+)
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 import os
@@ -67,6 +74,7 @@ from database import (
     get_course_engagement_analytics,
     get_course_material,
     get_course_opportunities_analytics,
+    get_db_connection,
     get_google_account,
     get_poll_details,
     get_session_with_user,
@@ -155,6 +163,8 @@ MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB upload limit
 async def lifespan(app: FastAPI):
     """Safely initialize database schema on application startup."""
     init_db()
+    if is_production():
+        validate_production_config()
     yield
 
 
@@ -169,20 +179,10 @@ app = FastAPI(
 )
 
 
-# Allow local development frontend origins
+# Configurable CORS origins with credential support
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:5174",
-        "http://127.0.0.1:5174",
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "http://localhost:4173",
-        "http://127.0.0.1:4173",
-    ],
-    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:[0-9]+)?$",
+    allow_origins=get_cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -324,13 +324,67 @@ AcademicItemStatusUpdate = AcademicItemUpdate
 
 
 @app.get("/api/health")
-def health_check():
-    """Health check endpoint to verify backend service status."""
+def health_check(response: Response):
+    """Health check endpoint to verify backend service and database readiness."""
+    db_connected = False
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT 1;")
+            row = cur.fetchone()
+            if row and row[0] == 1:
+                db_connected = True
+    except Exception:
+        db_connected = False
+
+    if not db_connected:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return {
+            "status": "unhealthy",
+            "project": "SMART",
+            "version": "0.2.0",
+            "database": "disconnected",
+        }
+
     return {
         "status": "healthy",
         "project": "SMART",
         "version": "0.2.0",
+        "database": "connected",
         "message": "SMART backend is running",
+    }
+
+
+@app.get("/api/health/live")
+def health_liveness():
+    """Liveness probe: verifies process is running."""
+    return {"status": "alive"}
+
+
+@app.get("/api/health/ready")
+def health_readiness(response: Response):
+    """Readiness probe: verifies database connection is ready to serve traffic."""
+    db_connected = False
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT 1;")
+            row = cur.fetchone()
+            if row and row[0] == 1:
+                db_connected = True
+    except Exception:
+        db_connected = False
+
+    if not db_connected:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return {
+            "status": "not_ready",
+            "database": "disconnected",
+        }
+
+    return {
+        "status": "ready",
+        "database": "connected",
     }
 
 
@@ -984,6 +1038,32 @@ SMART_ENV = os.environ.get("SMART_ENV", "development").strip().lower()
 IS_PRODUCTION = SMART_ENV == "production"
 
 
+def apply_session_cookie(response: Response, session_id: str) -> None:
+    """Set authenticated session cookie with environment-appropriate security attributes."""
+    cfg = get_cookie_settings()
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=session_id,
+        httponly=cfg["httponly"],
+        samesite=cfg["samesite"],
+        secure=cfg["secure"],
+        max_age=SESSION_DURATION_HOURS * 3600,
+        path=cfg["path"],
+    )
+
+
+def clear_session_cookie(response: Response) -> None:
+    """Clear session cookie ensuring matching path, samesite, and secure attributes."""
+    cfg = get_cookie_settings()
+    response.delete_cookie(
+        key=SESSION_COOKIE_NAME,
+        path=cfg["path"],
+        samesite=cfg["samesite"],
+        secure=cfg["secure"],
+        httponly=cfg["httponly"],
+    )
+
+
 class LoginRequest(BaseModel):
     """Payload for user login / demo sign-in."""
     email: str
@@ -1077,8 +1157,8 @@ def login_user(payload: LoginRequest, response: Response) -> dict[str, Any]:
             detail=f"Account not provisioned: '{email}' has not been assigned a SMART role. Contact your administrator.",
         )
 
-    # In production, disable demo accounts
-    if IS_PRODUCTION and user.get("is_demo"):
+    # In production, check if demo accounts are permitted
+    if user.get("is_demo") and not is_demo_login_allowed():
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Demo authentication identities are disabled in production environments.",
@@ -1118,15 +1198,7 @@ def login_user(payload: LoginRequest, response: Response) -> dict[str, Any]:
         expires_at_iso=expires_iso,
     )
 
-    response.set_cookie(
-        key=SESSION_COOKIE_NAME,
-        value=session_id,
-        httponly=True,
-        samesite="lax",
-        secure=IS_PRODUCTION,  # Secure cookie automatically enabled in production HTTPS
-        max_age=SESSION_DURATION_HOURS * 3600,
-        path="/",
-    )
+    apply_session_cookie(response, session_id)
 
     return {
         "status": "authenticated",
@@ -1169,7 +1241,7 @@ def logout_user(
     """Invalidate authenticated session and clear HttpOnly cookie."""
     if smart_session:
         delete_user_session(smart_session)
-    response.delete_cookie(key=SESSION_COOKIE_NAME, path="/")
+    clear_session_cookie(response)
     return {"status": "logged_out", "message": "Session terminated successfully."}
 
 
@@ -1282,15 +1354,7 @@ async def handle_google_oauth_callback(
                         csrf_token=csrf_token,
                         expires_at_iso=expires_dt.isoformat(),
                     )
-                    redirect_res.set_cookie(
-                        key=SESSION_COOKIE_NAME,
-                        value=session_id,
-                        httponly=True,
-                        samesite="lax",
-                        secure=IS_PRODUCTION,
-                        max_age=SESSION_DURATION_HOURS * 3600,
-                        path="/",
-                    )
+                    apply_session_cookie(redirect_res, session_id)
         if raw:
             return {
                 "status": "connected",

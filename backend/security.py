@@ -45,6 +45,13 @@ def get_token_encryption_key() -> tuple[bytes, bool]:
             return derived, True
 
     # Ephemeral runtime key fallback
+    smart_env = os.environ.get("SMART_ENV", "development").strip().lower()
+    if smart_env == "production":
+        raise ValueError(
+            "Production configuration error: SMART_TOKEN_ENCRYPTION_KEY is required in production environments. "
+            "Ephemeral encryption keys are prohibited."
+        )
+
     if _RUNTIME_ENCRYPTION_KEY is None:
         _RUNTIME_ENCRYPTION_KEY = Fernet.generate_key()
 
