@@ -5,9 +5,20 @@
  */
 
 export function getApiBaseUrl() {
-  if (import.meta.env.VITE_API_URL) {
-    return import.meta.env.VITE_API_URL;
+  const envUrl = import.meta.env.VITE_API_URL;
+  if (envUrl && typeof envUrl === "string" && envUrl.trim()) {
+    return envUrl.trim().replace(/\/+$/, "");
   }
+
+  // In production builds, never silently default to localhost or current hostname:8000
+  if (import.meta.env.PROD) {
+    throw new Error(
+      "Configuration Error: VITE_API_URL is not defined in the production build environment. " +
+      "Please set VITE_API_URL in your Vercel Project Settings (Environment Variables) and redeploy without build cache."
+    );
+  }
+
+  // Local development fallback
   if (typeof window !== "undefined" && window.location && window.location.hostname) {
     return `http://${window.location.hostname}:8000`;
   }
