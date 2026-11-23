@@ -1,16 +1,50 @@
 import { useState, useEffect, useId, useMemo, useCallback } from "react";
 import "./App.css";
+import Sidebar from "./components/Sidebar";
+import Topbar from "./components/Topbar";
 import ConfidenceBadge from "./components/ConfidenceBadge";
 import ReviewIndicator from "./components/ReviewIndicator";
 import EvidenceDrawer from "./components/EvidenceDrawer";
-import { matchesConfidence } from "./utils/confidenceFilter";
+import EditTaskModal from "./components/EditTaskModal";
+import TaskRelationshipsModal from "./components/TaskRelationshipsModal";
+import DashboardOverview from "./components/DashboardOverview";
+import LoginPage from "./components/LoginPage";
+import OpportunityExplorer from "./components/OpportunityExplorer";
+import ClassroomProgress from "./components/ClassroomProgress";
+import StudyMaterialsView from "./components/StudyMaterialsView";
+import TeacherDashboard from "./components/TeacherDashboard";
+import {
+  matchesConfidence,
+  matchesTaskFilters,
+  calculateDashboardStats,
+  ALLOWED_ACADEMIC_INTENTS,
+} from "./utils/confidenceFilter";
 import {
   extractAcademic,
+  extractAcademicFromSource,
   saveAcademicItem,
   getAcademicItems,
+  updateAcademicItem,
   updateAcademicItemStatus,
   deleteAcademicItem,
   getExportIcsUrl,
+  getGoogleAuthUrl,
+  getGoogleAuthStatus,
+  disconnectGoogleAccount,
+  toggleDemoData,
+  syncGmail,
+  syncClassroom,
+  getOpportunities,
+  updateStudentOpportunityStatus,
+  getTeacherOpportunitiesOverview,
+  getClassroomCourses,
+  getClassroomCoursework,
+  getClassroomSubmissions,
+  getTeacherCourseworkOverview,
+  getStudyMaterials,
+  loginUser,
+  getCurrentUser,
+  logoutUser,
 } from "./api";
 
 const CATEGORY_COLORS = {
@@ -21,9 +55,32 @@ const CATEGORY_COLORS = {
   Event: { bg: "#ecfdf5", text: "#047857", border: "#a7f3d0" },
 };
 
+function getTodayIsoString() {
+  const d = new Date();
+  const year = d.getFullYear();
+  const month = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function formatSourceLabel(sourceType) {
+  const s = (sourceType || "whatsapp").toLowerCase();
+  switch (s) {
+    case "gmail":
+      return "✉️ Gmail";
+    case "google_classroom":
+      return "🏫 Classroom";
+    case "manual":
+      return "✍️ Manual";
+    case "whatsapp":
+    default:
+      return "💬 WhatsApp";
+  }
+}
+
 export default function App() {
-  // Navigation: "analyze" or "tasks"
-  const [activeTab, setActiveTab] = useState("analyze");
+  // Navigation: "dashboard" | "tasks" | "analyze"
+  const [activeTab, setActiveTab] = useState("dashboard");
 
   // Chat analysis state
   const [file, setFile] = useState(null);
@@ -48,20 +105,54 @@ export default function App() {
   const [tasksError, setTasksError] = useState("");
   const [updatingTaskId, setUpdatingTaskId] = useState(null);
 
-  // Task filtering state
+  // Section and Task filtering state
+  const [taskSection, setTaskSection] = useState("all");
   const [taskSearch, setTaskSearch] = useState("");
   const [taskCategory, setTaskCategory] = useState("ALL");
   const [taskStatus, setTaskStatus] = useState("ALL");
   const [taskConfidence, setTaskConfidence] = useState("ALL");
+  const [taskPriority, setTaskPriority] = useState("ALL");
+  const [taskUrgency, setTaskUrgency] = useState("ALL");
+  const [taskImportance, setTaskImportance] = useState("ALL");
+  const [taskIntent, setTaskIntent] = useState("ALL");
+  const [taskReview, setTaskReview] = useState("ALL");
   const [taskDueBefore, setTaskDueBefore] = useState("");
   const [taskDueAfter, setTaskDueAfter] = useState("");
+  const [taskSourceType, setTaskSourceType] = useState("ALL");
+
+  // Multi-source chat/message input state (Phase 4.5)
+  const [inputSource, setInputSource] = useState("whatsapp"); // 'whatsapp' | 'gmail' | 'google_classroom' | 'manual'
+  const [manualText, setManualText] = useState("");
+
+  // SMART 2.1 - Authenticated User & Google State
+  const [currentUser, setCurrentUser] = useState(null);
+  const [authChecking, setAuthChecking] = useState(true);
+  const [googleAccount, setGoogleAccount] = useState({ connected: false });
+  const [googleLoading, setGoogleLoading] = useState(false);
+  const [googleError, setGoogleError] = useState("");
+
+  // SMART 2.1 - Academic Data States
+  const [opportunities, setOpportunities] = useState([]);
+  const [classroomCourses, setClassroomCourses] = useState([]);
+  const [classroomCoursework, setClassroomCoursework] = useState([]);
+  const [classroomSubmissions, setClassroomSubmissions] = useState([]);
+  const [classroomLoading, setClassroomLoading] = useState(false);
+  const [studyMaterials, setStudyMaterials] = useState([]);
+  const [teacherOverview, setTeacherOverview] = useState({ coursework: [], opportunities: [] });
+
+  const currentEmail = currentUser?.email || "";
+  const userRole = currentUser?.role || "student";
 
   // Modals & Notifications
   const [deleteModalItem, setDeleteModalItem] = useState(null);
   const [selectedEvidenceItem, setSelectedEvidenceItem] = useState(null);
+  const [editModalTask, setEditModalTask] = useState(null);
+  const [relationshipsModalTask, setRelationshipsModalTask] = useState(null);
   const [exportNotice, setExportNotice] = useState("");
+  const [isSidebarOpen, setIsSidebarOpen] = useState(false);
 
   const fileInputId = useId();
+  const todayStr = useMemo(() => getTodayIsoString(), []);
 
   // Load saved tasks from backend
   const loadSavedTasks = useCallback(async () => {
@@ -77,10 +168,204 @@ export default function App() {
     }
   }, []);
 
-  // Fetch saved tasks on mount
+  // Fetch Google Auth Status
+  const loadGoogleStatus = useCallback(async () => {
+    try {
+      const status = await getGoogleAuthStatus(currentEmail, userRole);
+      setGoogleAccount(status);
+    } catch {
+      setGoogleAccount({ connected: false });
+    }
+  }, [currentEmail, userRole]);
+
+  // Fetch Opportunities
+  const loadOpportunities = useCallback(async () => {
+    try {
+      const data = await getOpportunities(currentEmail, userRole);
+      setOpportunities(data);
+    } catch (err) {
+      console.error("Failed to load opportunities:", err);
+    }
+  }, [currentEmail, userRole]);
+
+  // Fetch Classroom Data
+  const loadClassroomData = useCallback(async () => {
+    setClassroomLoading(true);
+    try {
+      const [courses, coursework, subs] = await Promise.all([
+        getClassroomCourses(currentEmail, userRole),
+        getClassroomCoursework(null, currentEmail, userRole),
+        getClassroomSubmissions(null, currentEmail, userRole),
+      ]);
+      setClassroomCourses(courses);
+      setClassroomCoursework(coursework);
+      setClassroomSubmissions(subs);
+    } catch (err) {
+      console.error("Failed to load classroom data:", err);
+    } finally {
+      setClassroomLoading(false);
+    }
+  }, [currentEmail, userRole]);
+
+  // Fetch Study Materials
+  const loadMaterials = useCallback(async () => {
+    try {
+      const mats = await getStudyMaterials(null, currentEmail, userRole);
+      setStudyMaterials(mats);
+    } catch (err) {
+      console.error("Failed to load materials:", err);
+    }
+  }, [currentEmail, userRole]);
+
+  // Fetch Teacher Overview
+  const loadTeacherOverview = useCallback(async () => {
+    if (userRole !== "teacher") return;
+    try {
+      const [cw, opp] = await Promise.all([
+        getTeacherCourseworkOverview(userRole, currentEmail),
+        getTeacherOpportunitiesOverview(userRole),
+      ]);
+      setTeacherOverview({ coursework: cw, opportunities: opp });
+    } catch (err) {
+      console.error("Failed to load teacher overview:", err);
+    }
+  }, [currentEmail, userRole]);
+
+  // Check existing session on mount
   useEffect(() => {
+    async function checkAuth() {
+      setAuthChecking(true);
+      try {
+        const user = await getCurrentUser();
+        if (user) {
+          setCurrentUser(user);
+        }
+      } catch {
+        setCurrentUser(null);
+      } finally {
+        setAuthChecking(false);
+      }
+    }
+    checkAuth();
+  }, []);
+
+  // Login handler
+  const handleLogin = async (email) => {
+    const res = await loginUser(email);
+    setCurrentUser(res.user);
+    setActiveTab("dashboard");
+  };
+
+  // Logout handler
+  const handleLogout = async () => {
+    await logoutUser();
+    setCurrentUser(null);
+    setActiveTab("dashboard");
+  };
+
+  // Initial and reactive load
+  useEffect(() => {
+    if (!currentUser) return;
     loadSavedTasks();
-  }, [loadSavedTasks]);
+    loadGoogleStatus();
+    loadOpportunities();
+    loadClassroomData();
+    loadMaterials();
+    if (userRole === "teacher") {
+      loadTeacherOverview();
+    }
+  }, [currentUser, loadSavedTasks, loadGoogleStatus, loadOpportunities, loadClassroomData, loadMaterials, loadTeacherOverview, userRole]);
+
+  // Handlers for SMART 2.1
+  const handleConnectGoogle = async () => {
+    try {
+      setGoogleLoading(true);
+      setGoogleError("");
+      const res = await getGoogleAuthUrl(userRole, window.location.origin + "/oauth2callback");
+      if (res.auth_url) {
+        window.location.href = res.auth_url;
+      }
+    } catch (err) {
+      setGoogleError(err.message || "Failed to start Google OAuth flow.");
+    } finally {
+      setGoogleLoading(false);
+    }
+  };
+
+  const handleDisconnectGoogle = async () => {
+    try {
+      await disconnectGoogleAccount(currentEmail, userRole);
+      await loadGoogleStatus();
+    } catch (err) {
+      setGoogleError(err.message || "Failed to disconnect account.");
+    }
+  };
+
+  const handleToggleDemoData = async () => {
+    try {
+      setGoogleLoading(true);
+      await toggleDemoData(currentEmail, userRole, !googleAccount?.is_demo);
+      await Promise.all([
+        loadGoogleStatus(),
+        loadOpportunities(),
+        loadClassroomData(),
+        loadMaterials(),
+        userRole === "teacher" ? loadTeacherOverview() : Promise.resolve(),
+      ]);
+    } catch (err) {
+      setGoogleError(err.message || "Failed to switch demo mode.");
+    } finally {
+      setGoogleLoading(false);
+    }
+  };
+
+  const handleSyncGmail = async () => {
+    setGoogleLoading(true);
+    setGoogleError("");
+    try {
+      await syncGmail(currentEmail, userRole);
+      await Promise.all([
+        loadOpportunities(),
+        loadMaterials(),
+        loadSavedTasks(),
+      ]);
+      setSuccess("Gmail messages, opportunities, and attachments synchronized successfully.");
+    } catch (err) {
+      setGoogleError(err.message || "Failed to sync Gmail.");
+    } finally {
+      setGoogleLoading(false);
+    }
+  };
+
+  const handleSyncClassroom = async () => {
+    setClassroomLoading(true);
+    setGoogleError("");
+    try {
+      await syncClassroom(currentEmail, userRole);
+      await Promise.all([
+        loadClassroomData(),
+        loadMaterials(),
+        userRole === "teacher" ? loadTeacherOverview() : Promise.resolve(),
+      ]);
+      setSuccess("Classroom coursework, submissions, and course materials synchronized.");
+    } catch (err) {
+      setGoogleError(err.message || "Failed to sync Classroom.");
+    } finally {
+      setClassroomLoading(false);
+    }
+  };
+
+  const handleUpdateOpportunityStatus = async (oppId, newStatus) => {
+    try {
+      await updateStudentOpportunityStatus(oppId, newStatus, currentEmail, userRole);
+      await loadOpportunities();
+      if (userRole === "teacher") {
+        await loadTeacherOverview();
+      }
+    } catch (err) {
+      setError(err.message || "Failed to update opportunity registration status.");
+    }
+  };
 
   // Handle uploaded file selection
   const handleSelectedFile = (selectedFile) => {
@@ -219,6 +504,44 @@ export default function App() {
     if (input) input.value = "";
   };
 
+  // Analyze manual text input (Phase 4.5)
+  const handleManualExtract = async (event) => {
+    event.preventDefault();
+    if (!manualText.trim()) {
+      setError("Please enter or paste communication text to analyze.");
+      return;
+    }
+
+    setLoading(true);
+    setError("");
+    setSuccess("");
+    setSaveStatusMap({});
+
+    try {
+      const data = await extractAcademicFromSource({
+        source_type: "manual",
+        raw_text: manualText.trim(),
+        sender: "Manual Note",
+      });
+      setFilename("Manual Note");
+      setTotalMessages(data.total_messages ?? 1);
+      const extractedItems = Array.isArray(data.items) ? data.items : [];
+      setItems(extractedItems);
+      setReviewCount(
+        data.review_required_count ??
+          extractedItems.filter((i) => i.review_required).length
+      );
+      setCategoryCounts(data.category_counts ?? {});
+      setSelectedFilter("ALL");
+      setCandidateConfidence("ALL");
+      setSuccess("Manual text analyzed and candidate items identified successfully.");
+    } catch (err) {
+      setError(err.message || "Something went wrong while analyzing manual text.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
   // Save a candidate item to database
   const handleSaveCandidate = async (candidate, index) => {
     setSaveStatusMap((prev) => ({
@@ -240,12 +563,23 @@ export default function App() {
         source_timestamp: candidate.source_timestamp,
         source_text: candidate.source_text,
         source_filename: filename || file?.name || "",
+        source_type: candidate.source_type || inputSource || "whatsapp",
+        source_id: candidate.source_id || null,
+        source_metadata: candidate.source_metadata || null,
         review_required: candidate.review_required,
         review_reasons: candidate.review_reasons,
         evidence_text: candidate.evidence_text,
         evidence_start_index: candidate.evidence_start_index,
         evidence_end_index: candidate.evidence_end_index,
         candidate_token: candidate.candidate_token,
+        is_actionable: candidate.is_actionable !== undefined ? candidate.is_actionable : true,
+        actionability_type: candidate.actionability_type || "action_required",
+        update_type: candidate.update_type || null,
+        is_range: candidate.is_range !== undefined ? candidate.is_range : false,
+        previous_due_date: candidate.previous_due_date || null,
+        replaces_task_id: candidate.replaces_task_id || null,
+        importance: candidate.importance || "UNASSESSED",
+        academic_intent: candidate.academic_intent || null,
       };
 
       const saved = await saveAcademicItem(payload);
@@ -299,6 +633,23 @@ export default function App() {
     }
   };
 
+  // Update task via edit modal
+  const handleEditSave = async (updates) => {
+    if (!editModalTask) return;
+    const taskId = editModalTask.id;
+    setTasksError("");
+    const updated = await updateAcademicItem(taskId, updates);
+    setSavedTasks((prev) =>
+      prev.map((t) => (t.id === taskId ? updated : t))
+    );
+    setEditModalTask(null);
+  };
+
+  const handleNavigateToSection = (sec) => {
+    setTaskSection(sec);
+    setActiveTab("tasks");
+  };
+
   // Delete task after confirmation
   const handleConfirmDelete = async () => {
     if (!deleteModalItem) return;
@@ -329,12 +680,15 @@ export default function App() {
   // Export deadlines button click
   const handleExportDeadlines = () => {
     const deadlineCount = savedTasks.filter(
-      (t) => t.due_date && (t.date_type || "").toLowerCase() === "deadline"
+      (t) =>
+        t.due_date &&
+        (t.date_type || "").toLowerCase() === "deadline" &&
+        !["completed", "cancelled", "superseded", "dismissed"].includes((t.status || "").toLowerCase())
     ).length;
 
     if (deadlineCount === 0) {
       setExportNotice(
-        "No confirmed deadlines available to export. Items must have a confirmed due date and date type 'deadline'."
+        "No confirmed active deadlines available to export. Deadlines must be active and have date type 'deadline'."
       );
       return;
     }
@@ -357,132 +711,188 @@ export default function App() {
     });
   }, [items, selectedFilter, candidateConfidence]);
 
+  // Overall dashboard statistics
+  const dashboardStats = useMemo(() => {
+    return calculateDashboardStats(savedTasks, todayStr);
+  }, [savedTasks, todayStr]);
+
   // Filtered saved tasks (My Academic Tasks tab)
   const filteredTasks = useMemo(() => {
-    return savedTasks.filter((task) => {
-      // Category filter
-      if (taskCategory !== "ALL" && task.category !== taskCategory) {
-        return false;
-      }
-
-      // Status filter
-      if (taskStatus !== "ALL" && (task.status || "").toLowerCase() !== taskStatus.toLowerCase()) {
-        return false;
-      }
-
-      // Confidence filter
-      if (!matchesConfidence(task, taskConfidence)) {
-        return false;
-      }
-
-      // Search keyword filter
-      if (taskSearch.trim()) {
-        const query = taskSearch.toLowerCase().trim();
-        const inTitle = (task.title || "").toLowerCase().includes(query);
-        const inDesc = (task.description || "").toLowerCase().includes(query);
-        const inSource = (task.source_text || "").toLowerCase().includes(query);
-        const inSender = (task.source_sender || "").toLowerCase().includes(query);
-        if (!inTitle && !inDesc && !inSource && !inSender) {
-          return false;
-        }
-      }
-
-      // Date range filter
-      if (taskDueBefore) {
-        if (!task.due_date || task.due_date > taskDueBefore) {
-          return false;
-        }
-      }
-
-      if (taskDueAfter) {
-        if (!task.due_date || task.due_date < taskDueAfter) {
-          return false;
-        }
-      }
-
-      return true;
-    });
-  }, [savedTasks, taskCategory, taskStatus, taskConfidence, taskSearch, taskDueBefore, taskDueAfter]);
-
-  // Tasks statistics
-  const taskStats = useMemo(() => {
-    const total = savedTasks.length;
-    const pending = savedTasks.filter((t) => (t.status || "").toLowerCase() === "pending").length;
-    const completed = savedTasks.filter((t) => (t.status || "").toLowerCase() === "completed").length;
-    const deadlines = savedTasks.filter(
-      (t) => t.due_date && (t.date_type || "").toLowerCase() === "deadline"
-    ).length;
-    return { total, pending, completed, deadlines };
-  }, [savedTasks]);
+    return savedTasks.filter((task) =>
+      matchesTaskFilters(task, {
+        search: taskSearch,
+        category: taskCategory,
+        status: taskStatus,
+        confidence: taskConfidence,
+        priority: taskPriority,
+        urgency: taskUrgency,
+        importance: taskImportance,
+        academic_intent: taskIntent,
+        review_required: taskReview,
+        due_before: taskDueBefore,
+        due_after: taskDueAfter,
+        section: taskSection,
+        source_type: taskSourceType,
+        todayStr,
+      })
+    );
+  }, [
+    savedTasks,
+    taskSearch,
+    taskCategory,
+    taskStatus,
+    taskConfidence,
+    taskPriority,
+    taskUrgency,
+    taskImportance,
+    taskIntent,
+    taskReview,
+    taskDueBefore,
+    taskDueAfter,
+    taskSection,
+    taskSourceType,
+    todayStr,
+  ]);
 
   const hasActiveTaskFilters =
     taskSearch !== "" ||
     taskCategory !== "ALL" ||
     taskStatus !== "ALL" ||
     taskConfidence !== "ALL" ||
+    taskPriority !== "ALL" ||
+    taskUrgency !== "ALL" ||
+    taskImportance !== "ALL" ||
+    taskIntent !== "ALL" ||
+    taskReview !== "ALL" ||
+    taskSourceType !== "ALL" ||
     taskDueBefore !== "" ||
-    taskDueAfter !== "";
+    taskDueAfter !== "" ||
+    taskSection !== "all";
 
   const handleClearTaskFilters = () => {
     setTaskSearch("");
     setTaskCategory("ALL");
     setTaskStatus("ALL");
     setTaskConfidence("ALL");
+    setTaskPriority("ALL");
+    setTaskUrgency("ALL");
+    setTaskImportance("ALL");
+    setTaskIntent("ALL");
+    setTaskReview("ALL");
+    setTaskSourceType("ALL");
     setTaskDueBefore("");
     setTaskDueAfter("");
+    setTaskSection("all");
   };
 
+  if (authChecking) {
+    return (
+      <div className="auth-loading-screen">
+        <div className="auth-spinner" aria-hidden="true" />
+        <p>Verifying SMART academic session...</p>
+      </div>
+    );
+  }
+
+  if (!currentUser) {
+    return <LoginPage onLoginSuccess={handleLogin} />;
+  }
+
   return (
-    <div className="app-layout">
-      {/* Top Navbar */}
-      <header className="navbar">
-        <div className="navbar-container">
-          <div className="navbar-brand">
-            <span className="brand-badge" aria-hidden="true">S</span>
-            <div className="brand-text">
-              <h1>SMART</h1>
-              <p>Academic Intelligence Dashboard</p>
-            </div>
-          </div>
-          <div className="navbar-meta">
-            <span className="prototype-tag">
-              <span className="dot" aria-hidden="true"></span> Local Prototype
-            </span>
-          </div>
-        </div>
-      </header>
+    <div className="saas-app-layout">
+      {/* SaaS Purple Gradient Sidebar */}
+      <Sidebar
+        activeTab={activeTab}
+        onSelectTab={(tab) => {
+          setActiveTab(tab);
+          if (tab === "tasks") {
+            loadSavedTasks();
+          }
+        }}
+        tasksCount={savedTasks.length}
+        candidatesCount={items.length}
+        opportunitiesCount={opportunities.length}
+        materialsCount={studyMaterials.length}
+        user={currentUser}
+        googleAccount={googleAccount}
+        onSyncGmail={handleSyncGmail}
+        onSyncClassroom={handleSyncClassroom}
+        onLogout={handleLogout}
+        isOpen={isSidebarOpen}
+        onClose={() => setIsSidebarOpen(false)}
+      />
 
-      {/* Main Tab Switcher */}
-      <nav className="nav-tabs-wrapper" aria-label="Main Navigation">
-        <div className="nav-tabs-container">
-          <button
-            type="button"
-            className={`nav-tab-btn ${activeTab === "analyze" ? "active" : ""}`}
-            onClick={() => setActiveTab("analyze")}
-            aria-selected={activeTab === "analyze"}
-            role="tab"
-          >
-            <span>💬 Analyze Chat</span>
-          </button>
-          <button
-            type="button"
-            className={`nav-tab-btn ${activeTab === "tasks" ? "active" : ""}`}
-            onClick={() => {
+      {/* Main SaaS Workspace Area */}
+      <div className="saas-main-wrapper">
+        <Topbar
+          activeTab={activeTab}
+          onToggleSidebar={() => setIsSidebarOpen((prev) => !prev)}
+          searchQuery={taskSearch}
+          onSearchChange={(q) => {
+            setTaskSearch(q);
+            if (activeTab !== "tasks" && q.trim()) {
               setActiveTab("tasks");
-              loadSavedTasks();
-            }}
-            aria-selected={activeTab === "tasks"}
-            role="tab"
-          >
-            <span>📋 My Academic Tasks</span>
-            <span className="nav-tab-badge" title="Saved tasks count">
-              {savedTasks.length}
-            </span>
-          </button>
-        </div>
-      </nav>
+            }
+          }}
+          onExportCalendar={handleExportDeadlines}
+          onNavigateToAnalyze={() => setActiveTab("analyze")}
+          deadlineCount={dashboardStats.deadlines}
+          user={currentUser}
+          googleAccount={googleAccount}
+          onConnectGoogle={handleConnectGoogle}
+          onDisconnectGoogle={handleDisconnectGoogle}
+          onLogout={handleLogout}
+        />
 
-      <main className="content-container">
+        {googleError && (
+          <div className="alert alert-error" role="alert" style={{ margin: "10px 24px" }}>
+            <span>⚠️ {googleError}</span>
+            <button
+              type="button"
+              className="btn btn-sm btn-secondary"
+              onClick={handleToggleDemoData}
+              style={{ marginLeft: "12px" }}
+            >
+              Use Offline Demo Data
+            </button>
+          </div>
+        )}
+        {googleLoading && (
+          <div className="alert alert-info" role="status" style={{ margin: "10px 24px" }}>
+            <span>⏳ Synchronizing with Google account...</span>
+          </div>
+        )}
+
+        <main className="saas-content-workspace">
+          {/* ================================================================= */}
+          {/* TAB 0: DASHBOARD OVERVIEW (STUDENT OR TEACHER)                     */}
+          {/* ================================================================= */}
+          {activeTab === "dashboard" && userRole === "student" && (
+            <DashboardOverview
+              stats={dashboardStats}
+              tasks={savedTasks}
+              user={currentUser}
+              courses={classroomCourses}
+              opportunities={opportunities}
+              materials={studyMaterials}
+              onNavigateToSection={handleNavigateToSection}
+              onExportDeadlines={handleExportDeadlines}
+              onSwitchToAnalyze={() => setActiveTab("analyze")}
+              onUpdateTaskStatus={handleUpdateStatus}
+              onOpenEvidence={(task) => setSelectedEvidenceItem(task)}
+              onOpenEdit={(task) => setEditModalTask(task)}
+              todayStr={todayStr}
+            />
+          )}
+
+          {activeTab === "dashboard" && userRole === "teacher" && (
+            <TeacherDashboard
+              coursesOverview={teacherOverview.coursework}
+              opportunitiesOverview={teacherOverview.opportunities}
+              user={currentUser}
+              onRefresh={loadTeacherOverview}
+            />
+          )}
         {/* ================================================================= */}
         {/* TAB 1: ANALYZE CHAT                                              */}
         {/* ================================================================= */}
@@ -506,79 +916,218 @@ export default function App() {
             <section className="card upload-card" aria-labelledby="upload-heading">
               <div className="card-header">
                 <div>
-                  <h2 id="upload-heading" className="card-title">Import Conversation Export</h2>
+                  <h2 id="upload-heading" className="card-title">Import Academic Communication</h2>
                   <p className="card-subtitle">
-                    Select or drop a WhatsApp exported <code>.txt</code> file (up to 5 MB).
+                    Select communication source: WhatsApp export, Gmail, Google Classroom, or direct manual text.
                   </p>
                 </div>
                 <span className="step-tag">STEP 1</span>
               </div>
 
-              <form onSubmit={handleUpload}>
-                <label
-                  htmlFor={fileInputId}
-                  className={`dropzone ${isDragging ? "dragging" : ""} ${file ? "has-file" : ""}`}
-                  onDragOver={handleDragOver}
-                  onDragLeave={handleDragLeave}
-                  onDrop={handleDrop}
+              {/* Source Switcher Tabs (Phase 4.5) */}
+              <div className="source-switcher-tabs" role="tablist" aria-label="Communication Source Selection">
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={inputSource === "whatsapp"}
+                  className={`source-tab-btn ${inputSource === "whatsapp" ? "active" : ""}`}
+                  onClick={() => {
+                    setInputSource("whatsapp");
+                    setError("");
+                  }}
                 >
-                  <div className="dropzone-icon" aria-hidden="true">📄</div>
-                  <div className="dropzone-text">
-                    <span className="dropzone-primary">
-                      {file ? file.name : "Choose a WhatsApp chat .txt file"}
-                    </span>
-                    <span className="dropzone-secondary">
-                      {file
-                        ? `${(file.size / 1024).toFixed(1)} KB · Ready to analyze`
-                        : "Drag and drop export file here, or click to browse"}
-                    </span>
-                  </div>
-                  <span className="browse-button">
-                    {file ? "Change file" : "Browse files"}
-                  </span>
-                  <input
-                    id={fileInputId}
-                    type="file"
-                    accept=".txt,text/plain"
-                    onChange={handleFileInputChange}
-                    disabled={loading}
-                    className="visually-hidden"
-                  />
-                </label>
+                  <span className="source-tab-icon">💬</span> WhatsApp Export
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={inputSource === "gmail"}
+                  className={`source-tab-btn ${inputSource === "gmail" ? "active" : ""}`}
+                  onClick={() => {
+                    setInputSource("gmail");
+                    setError("");
+                  }}
+                >
+                  <span className="source-tab-icon">✉️</span> Gmail <span className="coming-soon-pill">Preview</span>
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={inputSource === "google_classroom"}
+                  className={`source-tab-btn ${inputSource === "google_classroom" ? "active" : ""}`}
+                  onClick={() => {
+                    setInputSource("google_classroom");
+                    setError("");
+                  }}
+                >
+                  <span className="source-tab-icon">🏫</span> Google Classroom <span className="coming-soon-pill">Preview</span>
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={inputSource === "manual"}
+                  className={`source-tab-btn ${inputSource === "manual" ? "active" : ""}`}
+                  onClick={() => {
+                    setInputSource("manual");
+                    setError("");
+                  }}
+                >
+                  <span className="source-tab-icon">✍️</span> Manual Text
+                </button>
+              </div>
 
-                <div className="upload-footer">
-                  <p className="privacy-badge">
-                    <span className="info-icon" aria-hidden="true">🔒</span>
-                    Private and local: Processed entirely on your machine. No cloud APIs or external data transfer.
-                  </p>
-                  <div className="action-buttons">
-                    {file && (
-                      <button
-                        type="button"
-                        onClick={handleReset}
-                        className="btn btn-secondary"
-                        disabled={loading}
-                      >
-                        Clear
-                      </button>
-                    )}
-                    <button
-                      type="submit"
-                      className="btn btn-primary"
-                      disabled={!file || loading}
-                    >
-                      {loading ? (
-                        <>
-                          <span className="spinner" aria-hidden="true"></span>
-                          Parsing conversation...
-                        </>
-                      ) : (
-                        "Analyze conversation →"
+              {/* WhatsApp Dropzone */}
+              {inputSource === "whatsapp" && (
+                <form onSubmit={handleUpload}>
+                  <label
+                    htmlFor={fileInputId}
+                    className={`dropzone ${isDragging ? "dragging" : ""} ${file ? "has-file" : ""}`}
+                    onDragOver={handleDragOver}
+                    onDragLeave={handleDragLeave}
+                    onDrop={handleDrop}
+                  >
+                    <div className="dropzone-icon" aria-hidden="true">📄</div>
+                    <div className="dropzone-text">
+                      <span className="dropzone-primary">
+                        {file ? file.name : "Choose a WhatsApp chat .txt file"}
+                      </span>
+                      <span className="dropzone-secondary">
+                        {file
+                          ? `${(file.size / 1024).toFixed(1)} KB · Ready to analyze`
+                          : "Drag and drop export file here, or click to browse"}
+                      </span>
+                    </div>
+                    <span className="browse-button">
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                        <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
+                      </svg>
+                      <span>{file ? "Change file" : "Browse files"}</span>
+                    </span>
+                    <input
+                      id={fileInputId}
+                      type="file"
+                      accept=".txt,text/plain"
+                      onChange={handleFileInputChange}
+                      disabled={loading}
+                      className="visually-hidden"
+                    />
+                  </label>
+
+                  <div className="upload-footer">
+                    <p className="privacy-badge">
+                      <span className="info-icon" aria-hidden="true">🔒</span>
+                      Private and local: Processed entirely on your machine. No cloud APIs or external data transfer.
+                    </p>
+                    <div className="action-buttons">
+                      {file && (
+                        <button
+                          type="button"
+                          onClick={handleReset}
+                          className="btn btn-secondary"
+                          disabled={loading}
+                        >
+                          Clear
+                        </button>
                       )}
-                    </button>
+                      <button
+                        type="submit"
+                        className="btn btn-primary"
+                        disabled={!file || loading}
+                      >
+                        {loading ? (
+                          <>
+                            <span className="spinner" aria-hidden="true"></span>
+                            Parsing conversation...
+                          </>
+                        ) : (
+                          "Analyze conversation →"
+                        )}
+                      </button>
+                    </div>
                   </div>
+                </form>
+              )}
+
+              {/* Gmail Integration Preview Card */}
+              {inputSource === "gmail" && (
+                <div className="coming-soon-card">
+                  <div className="coming-soon-icon">✉️</div>
+                  <h3>Gmail Direct Ingestion (Integration Preview)</h3>
+                  <p>
+                    Connect institutional Gmail accounts to automatically scan academic circulars, exam notices, and course emails without manual exporting.
+                  </p>
+                  <div className="coming-soon-details">
+                    <span className="feature-chip">✓ Secure OAuth 2.0</span>
+                    <span className="feature-chip">✓ Label-based filtering</span>
+                    <span className="feature-chip">✓ RFC 2822 header parsing</span>
+                  </div>
+                  <p className="coming-soon-hint">
+                    To test email extraction right now, switch to <strong>Manual Text</strong> or use the backend <code>/api/extract-academic-source</code> endpoint with email payloads.
+                  </p>
                 </div>
-              </form>
+              )}
+
+              {/* Google Classroom Integration Preview Card */}
+              {inputSource === "google_classroom" && (
+                <div className="coming-soon-card">
+                  <div className="coming-soon-icon">🏫</div>
+                  <h3>Google Classroom Ingestion (Integration Preview)</h3>
+                  <p>
+                    Sync course announcements, lab submissions, and assignments directly from enrolled Google Classroom courses.
+                  </p>
+                  <div className="coming-soon-details">
+                    <span className="feature-chip">✓ Classroom API v1</span>
+                    <span className="feature-chip">✓ Coursework & Materials</span>
+                    <span className="feature-chip">✓ Automatic due date tracking</span>
+                  </div>
+                  <p className="coming-soon-hint">
+                    To test Classroom coursework extraction right now, switch to <strong>Manual Text</strong> or use the backend <code>/api/extract-academic-source</code> endpoint with coursework JSON.
+                  </p>
+                </div>
+              )}
+
+              {/* Manual Text Input Form */}
+              {inputSource === "manual" && (
+                <form onSubmit={handleManualExtract} className="manual-extract-form">
+                  <label htmlFor="manual-text-input" className="form-label">
+                    Paste Academic Announcement, Assignment, or Notice:
+                  </label>
+                  <textarea
+                    id="manual-text-input"
+                    rows={6}
+                    className="form-textarea"
+                    placeholder="e.g. Dr. Rao: Assignment 4 on Dynamic Programming is due on 2026-12-05 by 11:59 PM. Please submit your GitHub repository link."
+                    value={manualText}
+                    onChange={(e) => setManualText(e.target.value)}
+                    disabled={loading}
+                  />
+                  <div className="upload-footer" style={{ marginTop: 12 }}>
+                    <p className="privacy-badge">
+                      <span className="info-icon" aria-hidden="true">🔒</span>
+                      Processed entirely on your machine via local heuristic intelligence.
+                    </p>
+                    <div className="action-buttons">
+                      {manualText && (
+                        <button
+                          type="button"
+                          onClick={() => setManualText("")}
+                          className="btn btn-secondary"
+                          disabled={loading}
+                        >
+                          Clear
+                        </button>
+                      )}
+                      <button
+                        type="submit"
+                        className="btn btn-primary"
+                        disabled={!manualText.trim() || loading}
+                      >
+                        {loading ? "Analyzing..." : "Analyze Manual Text →"}
+                      </button>
+                    </div>
+                  </div>
+                </form>
+              )}
 
               {error && (
                 <div className="alert alert-error" role="alert">
@@ -756,6 +1305,10 @@ export default function App() {
                                 {item.category}
                               </span>
 
+                              <span className={`source-pill source-pill-${(item.source_type || inputSource || "whatsapp").toLowerCase()}`}>
+                                {formatSourceLabel(item.source_type || inputSource)}
+                              </span>
+
                               <ConfidenceBadge
                                 confidence={item.confidence}
                                 reasons={item.confidence_reasons}
@@ -770,6 +1323,36 @@ export default function App() {
                               {item.date_type && item.date_type !== "none" && (
                                 <span className="datetype-pill">
                                   {item.date_type === "deadline" ? "Submission Deadline" : "Event Date"}
+                                </span>
+                              )}
+
+                              {item.update_type && (
+                                <span className="datetype-pill" style={{ backgroundColor: "#fef3c7", color: "#92400e", borderColor: "#fde68a" }}>
+                                  {item.update_type.charAt(0).toUpperCase() + item.update_type.slice(1)}
+                                </span>
+                              )}
+
+                              {item.is_actionable === false && (
+                                <span className="datetype-pill" style={{ backgroundColor: "#f1f5f9", color: "#475569", borderColor: "#cbd5e1" }}>
+                                  Informational
+                                </span>
+                              )}
+
+                              {item.priority && (
+                                <span className={`priority-pill priority-${item.priority.toLowerCase()}`} title={item.priority_reasons?.join("; ") || ""}>
+                                  {item.priority}
+                                </span>
+                              )}
+
+                              {item.importance && item.importance !== "UNASSESSED" && (
+                                <span className={`importance-pill importance-${item.importance.toLowerCase()}`} title={item.importance_reasons?.join("; ") || ""}>
+                                  {item.importance === "HIGH" ? "High Impact" : (item.importance === "MEDIUM" ? "Core" : "Optional")}
+                                </span>
+                              )}
+
+                              {item.academic_intent && item.academic_intent !== item.category?.toLowerCase() && (
+                                <span className="intent-pill" title={item.academic_intent_reasons?.join("; ") || ""}>
+                                  {item.academic_intent.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase())}
                                 </span>
                               )}
                             </div>
@@ -791,6 +1374,16 @@ export default function App() {
                                 ) : (
                                   <span className="text-muted">No explicit date specified</span>
                                 )}
+                                {item.previous_due_date && (
+                                  <span className="text-muted" style={{ marginLeft: "8px" }}>
+                                    (Prev: {item.previous_due_date})
+                                  </span>
+                                )}
+                                {item.urgency && item.urgency !== "NO_DEADLINE" && (
+                                  <span className={`urgency-pill urgency-${item.urgency.toLowerCase()}`} title={item.urgency_reasons?.join("; ") || ""}>
+                                    {item.urgency === "CRITICAL" ? "Urgent" : item.urgency.replace(/_/g, " ")}
+                                  </span>
+                                )}
                               </span>
                             </div>
 
@@ -800,6 +1393,14 @@ export default function App() {
                               </div>
                             )}
                           </div>
+
+                          {/* Priority Rationale Box */}
+                          {item.priority_reasons && item.priority_reasons.length > 0 && (
+                            <div className="priority-reason-box">
+                              <span className="priority-reason-label">Priority Rationale:</span>
+                              <span className="priority-reason-text">{item.priority_reasons[0]}</span>
+                            </div>
+                          )}
 
                           {/* Review Explanations */}
                           <ReviewIndicator
@@ -984,28 +1585,56 @@ export default function App() {
               </div>
             )}
 
+            {/* Section Selector Pills */}
+            <div className="section-pill-group" role="tablist" aria-label="Task Sections">
+              {[
+                { id: "all", label: "All Tasks", count: dashboardStats.total },
+                { id: "today", label: "☀️ Today & Overdue", count: dashboardStats.overdue + dashboardStats.dueToday },
+                { id: "upcoming", label: "⏳ Upcoming", count: dashboardStats.upcoming },
+                { id: "high_priority", label: "⚡ High Priority", count: dashboardStats.highPriority },
+                { id: "needs_review", label: "⚠️ Needs Review", count: dashboardStats.needsReview },
+                {
+                  id: "completed_archived",
+                  label: "📁 Completed & Archived",
+                  count: dashboardStats.completed + dashboardStats.cancelled + dashboardStats.superseded + dashboardStats.dismissed,
+                },
+              ].map((sec) => (
+                <button
+                  key={sec.id}
+                  type="button"
+                  role="tab"
+                  aria-selected={taskSection === sec.id}
+                  onClick={() => setTaskSection(sec.id)}
+                  className={`section-tab-btn ${taskSection === sec.id ? "active" : ""}`}
+                >
+                  <span>{sec.label}</span>
+                  <span className="section-tab-badge">{sec.count}</span>
+                </button>
+              ))}
+            </div>
+
             {/* Task Statistics Bar */}
-            <div className="stats-grid">
+            <div className="task-stats-grid stats-grid">
               <div className="stat-card">
-                <span className="stat-label">Total Saved Tasks</span>
-                <span className="stat-value">{taskStats.total}</span>
-                <span className="stat-desc">In SQLite database</span>
+                <span className="stat-label">Tasks in View</span>
+                <span className="stat-value">{filteredTasks.length}</span>
+                <span className="stat-desc">Of {dashboardStats.total} total</span>
               </div>
               <div className="stat-card">
-                <span className="stat-label">Pending</span>
-                <span className="stat-value text-amber">{taskStats.pending}</span>
+                <span className="stat-label">Pending Active</span>
+                <span className="stat-value text-amber">{dashboardStats.active}</span>
                 <span className="stat-desc">Awaiting completion</span>
               </div>
               <div className="stat-card">
                 <span className="stat-label">Completed</span>
                 <span className="stat-value" style={{ color: "#059669" }}>
-                  {taskStats.completed}
+                  {dashboardStats.completed}
                 </span>
                 <span className="stat-desc">Tasks finished</span>
               </div>
               <div className="stat-card">
                 <span className="stat-label">Confirmed Deadlines</span>
-                <span className="stat-value text-blue">{taskStats.deadlines}</span>
+                <span className="stat-value text-blue">{dashboardStats.deadlines}</span>
                 <span className="stat-desc">Exportable to Calendar</span>
               </div>
             </div>
@@ -1050,6 +1679,24 @@ export default function App() {
                   />
                 </div>
 
+                {/* Academic Intent Dropdown */}
+                <div className="filter-input-group">
+                  <label htmlFor="task-intent-select">Academic Intent</label>
+                  <select
+                    id="task-intent-select"
+                    value={taskIntent}
+                    onChange={(e) => setTaskIntent(e.target.value)}
+                    className="filter-input"
+                  >
+                    <option value="ALL">All Intents</option>
+                    {ALLOWED_ACADEMIC_INTENTS.map((intent) => (
+                      <option key={intent} value={intent}>
+                        {intent.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase())}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
                 {/* Clear Filters */}
                 {hasActiveTaskFilters && (
                   <button
@@ -1057,7 +1704,7 @@ export default function App() {
                     onClick={handleClearTaskFilters}
                     className="btn-clear-filters"
                   >
-                    Clear Filters
+                    Clear All Filters
                   </button>
                 )}
               </div>
@@ -1067,7 +1714,7 @@ export default function App() {
                 <span className="status-control-label" style={{ alignSelf: "center" }}>
                   Status:
                 </span>
-                {["ALL", "pending", "completed", "dismissed"].map((st) => (
+                {["ALL", "pending", "completed", "cancelled", "superseded", "dismissed"].map((st) => (
                   <button
                     key={st}
                     type="button"
@@ -1096,7 +1743,41 @@ export default function App() {
                 ))}
               </div>
 
-              {/* Confidence Filter Pills */}
+              {/* Priority & Importance Pills */}
+              <div className="status-pill-group" style={{ marginTop: "10px" }}>
+                <span className="status-control-label" style={{ alignSelf: "center" }}>
+                  Priority:
+                </span>
+                {["ALL", "CRITICAL", "HIGH", "MEDIUM", "LOW"].map((pri) => (
+                  <button
+                    key={pri}
+                    type="button"
+                    onClick={() => setTaskPriority(pri)}
+                    className={`status-tab-btn ${taskPriority === pri ? "active" : ""}`}
+                  >
+                    {pri === "ALL" ? "All Priority" : pri}
+                  </button>
+                ))}
+
+                <span
+                  className="status-control-label"
+                  style={{ alignSelf: "center", marginLeft: "12px" }}
+                >
+                  Importance:
+                </span>
+                {["ALL", "HIGH", "MEDIUM", "LOW", "UNASSESSED"].map((imp) => (
+                  <button
+                    key={imp}
+                    type="button"
+                    onClick={() => setTaskImportance(imp)}
+                    className={`status-tab-btn ${taskImportance === imp ? "active" : ""}`}
+                  >
+                    {imp === "ALL" ? "All Importance" : imp === "HIGH" ? "High Impact" : imp === "MEDIUM" ? "Core" : imp}
+                  </button>
+                ))}
+              </div>
+
+              {/* Confidence & Review Requirement Pills */}
               <div className="status-pill-group" style={{ marginTop: "10px" }}>
                 <span className="status-control-label" style={{ alignSelf: "center" }}>
                   Confidence:
@@ -1110,6 +1791,50 @@ export default function App() {
                     aria-pressed={taskConfidence === level}
                   >
                     {level === "ALL" ? "All Confidence" : level}
+                  </button>
+                ))}
+
+                <span
+                  className="status-control-label"
+                  style={{ alignSelf: "center", marginLeft: "12px" }}
+                >
+                  Review:
+                </span>
+                {[
+                  { id: "ALL", label: "All Review" },
+                  { id: "NEEDS_REVIEW", label: "⚠️ Needs Review" },
+                  { id: "NO_REVIEW", label: "✓ Clear" },
+                ].map((rev) => (
+                  <button
+                    key={rev.id}
+                    type="button"
+                    onClick={() => setTaskReview(rev.id)}
+                    className={`status-tab-btn ${taskReview === rev.id ? "active" : ""}`}
+                  >
+                    {rev.label}
+                  </button>
+                ))}
+              </div>
+
+              {/* Source Type Filter Pills (Phase 4.5) */}
+              <div className="status-pill-group" style={{ marginTop: "10px" }}>
+                <span className="status-control-label" style={{ alignSelf: "center" }}>
+                  Source:
+                </span>
+                {[
+                  { id: "ALL", label: "All Sources" },
+                  { id: "whatsapp", label: "💬 WhatsApp" },
+                  { id: "gmail", label: "✉️ Gmail" },
+                  { id: "google_classroom", label: "🏫 Classroom" },
+                  { id: "manual", label: "✍️ Manual" },
+                ].map((st) => (
+                  <button
+                    key={st.id}
+                    type="button"
+                    onClick={() => setTaskSourceType(st.id)}
+                    className={`status-tab-btn ${taskSourceType === st.id ? "active" : ""}`}
+                  >
+                    {st.label}
                   </button>
                 ))}
               </div>
@@ -1188,6 +1913,10 @@ export default function App() {
                             {task.status ? task.status.toUpperCase() : "PENDING"}
                           </span>
 
+                          <span className={`source-pill source-pill-${(task.source_type || "whatsapp").toLowerCase()}`}>
+                            {formatSourceLabel(task.source_type)}
+                          </span>
+
                           <ConfidenceBadge
                             confidence={task.confidence}
                             reasons={task.confidence_reasons}
@@ -1202,6 +1931,42 @@ export default function App() {
                           {task.date_type && task.date_type !== "none" && task.date_type !== "unknown" && (
                             <span className="datetype-pill">
                               {task.date_type === "deadline" ? "Submission Deadline" : "Event Date"}
+                            </span>
+                          )}
+
+                          {task.update_type && (
+                            <span className="datetype-pill" style={{ backgroundColor: "#fef3c7", color: "#92400e", borderColor: "#fde68a" }}>
+                              {task.update_type.charAt(0).toUpperCase() + task.update_type.slice(1)}
+                            </span>
+                          )}
+
+                          {task.is_actionable === false && (
+                            <span className="datetype-pill" style={{ backgroundColor: "#f1f5f9", color: "#475569", borderColor: "#cbd5e1" }}>
+                              Informational
+                            </span>
+                          )}
+
+                          {task.priority && (
+                            <span className={`priority-pill priority-${task.priority.toLowerCase()}`} title={task.priority_reasons?.join("; ") || ""}>
+                              {task.priority}
+                            </span>
+                          )}
+
+                          {task.importance && task.importance !== "UNASSESSED" && (
+                            <span className={`importance-pill importance-${task.importance.toLowerCase()}`} title={task.importance_reasons?.join("; ") || ""}>
+                              {task.importance === "HIGH" ? "High Impact" : (task.importance === "MEDIUM" ? "Core" : "Optional")}
+                            </span>
+                          )}
+
+                          {task.academic_intent && task.academic_intent !== task.category?.toLowerCase() && (
+                            <span className="intent-pill" title={task.academic_intent_reasons?.join("; ") || ""}>
+                              {task.academic_intent.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase())}
+                            </span>
+                          )}
+
+                          {task.replaces_task_id && (
+                            <span className="datetype-pill" style={{ backgroundColor: "#e0e7ff", color: "#3730a3", borderColor: "#c7d2fe" }}>
+                              Replaces #{task.replaces_task_id}
                             </span>
                           )}
                         </div>
@@ -1226,6 +1991,16 @@ export default function App() {
                             ) : (
                               <span className="text-muted">No date specified</span>
                             )}
+                            {task.previous_due_date && (
+                              <span className="text-muted" style={{ marginLeft: "8px" }}>
+                                (Prev: {task.previous_due_date})
+                              </span>
+                            )}
+                            {task.urgency && task.urgency !== "NO_DEADLINE" && (
+                              <span className={`urgency-pill urgency-${task.urgency.toLowerCase()}`} title={task.urgency_reasons?.join("; ") || ""}>
+                                {task.urgency === "CRITICAL" ? "Urgent" : task.urgency.replace(/_/g, " ")}
+                              </span>
+                            )}
                           </span>
                         </div>
 
@@ -1235,6 +2010,14 @@ export default function App() {
                           </div>
                         )}
                       </div>
+
+                      {/* Priority Rationale Box */}
+                      {task.priority_reasons && task.priority_reasons.length > 0 && (
+                        <div className="priority-reason-box">
+                          <span className="priority-reason-label">Priority Rationale:</span>
+                          <span className="priority-reason-text">{task.priority_reasons[0]}</span>
+                        </div>
+                      )}
 
                       {/* Review Explanations */}
                       <ReviewIndicator
@@ -1263,50 +2046,78 @@ export default function App() {
                         </div>
                       </details>
 
-                      {/* Actions Row: Status Switcher & Delete */}
+                      {/* Actions Row: Status Switcher, Edit, Relationships, Evidence & Delete */}
                       <div className="task-actions-row">
                         <div className="status-switch-group">
-                          <span className="status-control-label">Update Status:</span>
+                          <span className="status-control-label">Status:</span>
 
-                          <button
-                            type="button"
-                            onClick={() => handleUpdateStatus(task.id, "pending")}
-                            disabled={isUpdating || task.status === "pending"}
-                            className={`btn-status-option ${task.status === "pending" ? "active" : ""}`}
-                            aria-label="Mark task as pending"
-                          >
-                            Pending
-                          </button>
+                          {task.status === "completed" ? (
+                            <button
+                              type="button"
+                              onClick={() => handleUpdateStatus(task.id, "pending")}
+                              disabled={isUpdating}
+                              className="btn-status-option active"
+                              aria-label="Reopen task"
+                              title="Reopen task and mark pending"
+                            >
+                              ↺ Reopen Task
+                            </button>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={() => handleUpdateStatus(task.id, "completed")}
+                              disabled={isUpdating}
+                              className="btn-status-option"
+                              aria-label="Mark task as completed"
+                              title="Mark task completed"
+                            >
+                              ✓ Complete
+                            </button>
+                          )}
 
-                          <button
-                            type="button"
-                            onClick={() => handleUpdateStatus(task.id, "completed")}
-                            disabled={isUpdating || task.status === "completed"}
-                            className={`btn-status-option ${task.status === "completed" ? "active" : ""}`}
-                            aria-label="Mark task as completed"
-                          >
-                            ✓ Completed
-                          </button>
-
-                          <button
-                            type="button"
-                            onClick={() => handleUpdateStatus(task.id, "dismissed")}
-                            disabled={isUpdating || task.status === "dismissed"}
-                            className={`btn-status-option ${task.status === "dismissed" ? "active" : ""}`}
-                            aria-label="Dismiss task"
-                          >
-                            Dismiss
-                          </button>
+                          {task.status !== "dismissed" && (
+                            <button
+                              type="button"
+                              onClick={() => handleUpdateStatus(task.id, "dismissed")}
+                              disabled={isUpdating}
+                              className="btn-status-option"
+                              aria-label="Dismiss task"
+                              title="Dismiss task"
+                            >
+                              Dismiss
+                            </button>
+                          )}
 
                           {isUpdating && <span className="spinner" aria-hidden="true"></span>}
                         </div>
 
-                        <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+                          <button
+                            type="button"
+                            className="btn-evidence"
+                            onClick={() => setEditModalTask(task)}
+                            aria-label={`Edit task ${task.title}`}
+                            title="Edit task details, due date, category, importance"
+                          >
+                            ✏️ Edit
+                          </button>
+
+                          <button
+                            type="button"
+                            className="btn-evidence"
+                            onClick={() => setRelationshipsModalTask(task)}
+                            aria-label={`View relationships for ${task.title}`}
+                            title="View task lineage and revisions"
+                          >
+                            🔗 Lineage
+                          </button>
+
                           <button
                             type="button"
                             className="btn-evidence"
                             onClick={() => setSelectedEvidenceItem(task)}
                             aria-label={`View evidence for ${task.title}`}
+                            title="Inspect source message evidence"
                           >
                             🔍 Evidence
                           </button>
@@ -1316,6 +2127,7 @@ export default function App() {
                             onClick={() => setDeleteModalItem(task)}
                             className="btn-delete-task"
                             aria-label={`Delete task ${task.title}`}
+                            title="Delete task from database"
                           >
                             🗑 Delete
                           </button>
@@ -1328,7 +2140,61 @@ export default function App() {
             )}
           </section>
         )}
-      </main>
+          {/* ================================================================= */}
+          {/* TAB 3: OPPORTUNITIES & COMPETITIONS (SMART 2.1)                   */}
+          {/* ================================================================= */}
+          {activeTab === "opportunities" && (
+            <OpportunityExplorer
+              opportunities={opportunities}
+              onUpdateStatus={handleUpdateOpportunityStatus}
+              userRole={userRole}
+            />
+          )}
+
+          {/* ================================================================= */}
+          {/* TAB 4: GOOGLE CLASSROOM & PROGRESS (SMART 2.1)                    */}
+          {/* ================================================================= */}
+          {activeTab === "classroom" && (
+            <ClassroomProgress
+              courses={classroomCourses}
+              coursework={classroomCoursework}
+              submissions={classroomSubmissions}
+              onSync={handleSyncClassroom}
+              loading={classroomLoading}
+            />
+          )}
+
+          {/* ================================================================= */}
+          {/* TAB 5: STUDY MATERIALS REPOSITORY (SMART 2.1)                     */}
+          {/* ================================================================= */}
+          {activeTab === "materials" && (
+            <StudyMaterialsView
+              materials={studyMaterials}
+              courses={classroomCourses}
+            />
+          )}
+
+          {/* ================================================================= */}
+          {/* TAB 6: TEACHER COURSE PROGRESS (SMART 2.1 - ROLE RESTRICTED)     */}
+          {/* ================================================================= */}
+          {activeTab === "teacher" && userRole === "teacher" && (
+            <TeacherDashboard
+              coursesOverview={teacherOverview.coursework}
+              opportunitiesOverview={teacherOverview.opportunities}
+              user={currentUser}
+              onRefresh={loadTeacherOverview}
+            />
+          )}
+        </main>
+
+        {/* Footer inside main layout column */}
+        <footer className="footer">
+          <div className="footer-container">
+            <span>SMART · Academic Communication Intelligence System</span>
+            <span>Phase 2 · SQLite Persistence &amp; Task Management</span>
+          </div>
+        </footer>
+      </div>
 
       {/* Delete Confirmation Modal */}
       {deleteModalItem && (
@@ -1373,6 +2239,29 @@ export default function App() {
         </div>
       )}
 
+      {/* Edit Task Modal */}
+      {editModalTask && (
+        <EditTaskModal
+          task={editModalTask}
+          onClose={() => setEditModalTask(null)}
+          onSave={handleEditSave}
+        />
+      )}
+
+      {/* Task Lineage & Relationships Modal */}
+      {relationshipsModalTask && (
+        <TaskRelationshipsModal
+          task={relationshipsModalTask}
+          onClose={() => setRelationshipsModalTask(null)}
+          onSelectTask={(id) => {
+            const target = savedTasks.find((t) => t.id === id);
+            if (target) {
+              setTaskSearch(String(id));
+            }
+          }}
+        />
+      )}
+
       {/* Evidence Inspection Drawer */}
       {selectedEvidenceItem && (
         <EvidenceDrawer
@@ -1380,14 +2269,6 @@ export default function App() {
           onClose={() => setSelectedEvidenceItem(null)}
         />
       )}
-
-      {/* Footer */}
-      <footer className="footer">
-        <div className="footer-container">
-          <span>SMART · Academic Communication Intelligence System</span>
-          <span>Phase 2 · SQLite Persistence &amp; Task Management</span>
-        </div>
-      </footer>
     </div>
   );
 }

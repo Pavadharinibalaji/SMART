@@ -13,6 +13,34 @@
 export const ALLOWED_CONFIDENCE_LEVELS = ["HIGH", "MEDIUM", "LOW", "UNASSESSED"];
 export const CONFIDENCE_FILTER_OPTIONS = ["ALL", ...ALLOWED_CONFIDENCE_LEVELS];
 
+export const ALLOWED_PRIORITY_LEVELS = ["CRITICAL", "HIGH", "MEDIUM", "LOW"];
+export const ALLOWED_IMPORTANCE_LEVELS = ["HIGH", "MEDIUM", "LOW", "UNASSESSED"];
+export const ALLOWED_URGENCY_LEVELS = [
+  "CRITICAL",
+  "HIGH",
+  "MEDIUM",
+  "LOW",
+  "NO_DEADLINE",
+  "NEEDS_REVIEW",
+];
+export const ALLOWED_ACADEMIC_INTENTS = [
+  "assignment",
+  "exam",
+  "laboratory",
+  "project",
+  "seminar",
+  "attendance",
+  "scholarship",
+  "placement",
+  "competition",
+  "workshop",
+  "administrative",
+  "academic_announcement",
+];
+
+export const ALLOWED_SOURCE_TYPES = ["whatsapp", "gmail", "google_classroom", "manual"];
+export const SOURCE_TYPE_OPTIONS = ["ALL", ...ALLOWED_SOURCE_TYPES];
+
 /**
  * Normalizes any confidence input to one of the four standard levels.
  * Consistent with ConfidenceBadge and backend persistence rules:
@@ -126,7 +154,272 @@ export function matchesTaskFilters(task, filters = {}) {
     }
   }
 
+  // 6. Priority filter
+  if (filters.priority && filters.priority !== "ALL") {
+    if ((task.priority || "").toUpperCase() !== filters.priority.toUpperCase()) {
+      return false;
+    }
+  }
+
+  // 7. Urgency filter
+  if (filters.urgency && filters.urgency !== "ALL") {
+    if ((task.urgency || "").toUpperCase() !== filters.urgency.toUpperCase()) {
+      return false;
+    }
+  }
+
+  // 8. Importance filter
+  if (filters.importance && filters.importance !== "ALL") {
+    if ((task.importance || "").toUpperCase() !== filters.importance.toUpperCase()) {
+      return false;
+    }
+  }
+
+  // 9. Academic Intent filter
+  if (filters.academic_intent && filters.academic_intent !== "ALL") {
+    if ((task.academic_intent || "").toLowerCase() !== filters.academic_intent.toLowerCase()) {
+      return false;
+    }
+  }
+
+  // 10. Review Required filter
+  if (filters.review_required && filters.review_required !== "ALL") {
+    const wantsReview = filters.review_required === "NEEDS_REVIEW" || filters.review_required === true;
+    if (Boolean(task.review_required) !== wantsReview) {
+      return false;
+    }
+  }
+
+  // 11. Section filter
+  if (filters.section && filters.section !== "all") {
+    if (!taskMatchesSection(task, filters.section, filters.todayStr)) {
+      return false;
+    }
+  }
+
+  // 12. Source Type filter
+  if (filters.source_type && filters.source_type !== "ALL") {
+    const taskSource = (task.source_type || "whatsapp").toLowerCase();
+    if (taskSource !== filters.source_type.toLowerCase()) {
+      return false;
+    }
+  }
+
   return true;
+}
+
+/**
+ * Checks whether an academic task belongs to a specific dashboard section.
+ *
+ * Sections:
+ * - 'today': Active tasks overdue or due today
+ * - 'upcoming': Active tasks with future deadlines
+ * - 'high_priority': Active tasks with CRITICAL or HIGH priority
+ * - 'needs_review': Tasks requiring review, ambiguous dates, or low confidence
+ * - 'completed_archived': Tasks with status completed, cancelled, superseded, or dismissed
+ * - 'all': All tasks
+ *
+ * @param {Object} task
+ * @param {string} section
+ * @param {string} [todayStr] - Reference date 'YYYY-MM-DD'
+ * @returns {boolean}
+ */
+export function taskMatchesSection(task, section, todayStr) {
+  if (!task) return false;
+  const status = (task.status || "pending").toLowerCase();
+  const isArchived = ["completed", "cancelled", "superseded", "dismissed"].includes(status);
+
+  if (section === "all" || !section) {
+    return true;
+  }
+
+  if (section === "completed_archived") {
+    return isArchived;
+  }
+
+  // Inactive tasks do not appear in active obligation sections
+  if (isArchived) {
+    return false;
+  }
+
+  const isOverdue =
+    (task.urgency === "CRITICAL" &&
+      (task.delta_days < 0 ||
+        (Array.isArray(task.urgency_reasons) &&
+          task.urgency_reasons.some((r) => r.toLowerCase().includes("overdue"))))) ||
+    (Boolean(task.due_date) && Boolean(todayStr) && task.due_date < todayStr);
+
+  const isDueToday =
+    (task.urgency === "CRITICAL" && task.delta_days === 0) ||
+    (Boolean(task.due_date) && Boolean(todayStr) && task.due_date === todayStr);
+
+  if (section === "today") {
+    return isOverdue || isDueToday;
+  }
+
+  if (section === "upcoming") {
+    return Boolean(
+      task.due_date &&
+        (!todayStr || task.due_date > todayStr) &&
+        (task.delta_days === undefined || task.delta_days > 0)
+    );
+  }
+
+  if (section === "high_priority") {
+    return task.priority === "CRITICAL" || task.priority === "HIGH";
+  }
+
+  if (section === "needs_review") {
+    return (
+      Boolean(task.review_required) ||
+      task.date_status === "needs_review" ||
+      task.urgency === "NEEDS_REVIEW" ||
+      task.confidence === "LOW"
+    );
+  }
+
+  return true;
+}
+
+/**
+ * Calculates academic dashboard metrics from saved tasks.
+ * Ensures inactive tasks (cancelled, superseded, dismissed) are separated from active obligations.
+ *
+ * @param {Array} tasks
+ * @param {string} [todayStr]
+ * @returns {Object} Dashboard summary statistics
+ */
+export function calculateDashboardStats(tasks, todayStr) {
+  if (!Array.isArray(tasks)) {
+    return {
+      total: 0,
+      active: 0,
+      pending: 0,
+      completed: 0,
+      cancelled: 0,
+      superseded: 0,
+      dismissed: 0,
+      dueToday: 0,
+      overdue: 0,
+      upcoming: 0,
+      highPriority: 0,
+      needsReview: 0,
+      deadlines: 0,
+      attentionRequired: 0,
+      categoryCounts: {},
+      priorityCounts: { CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0 },
+      intentCounts: {},
+      sourceTypeCounts: { whatsapp: 0, gmail: 0, google_classroom: 0, manual: 0 },
+    };
+  }
+
+  const categoryCounts = {};
+  const priorityCounts = { CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0 };
+  const intentCounts = {};
+  const sourceTypeCounts = { whatsapp: 0, gmail: 0, google_classroom: 0, manual: 0 };
+
+  let total = tasks.length;
+  let pending = 0;
+  let completed = 0;
+  let cancelled = 0;
+  let superseded = 0;
+  let dismissed = 0;
+  let dueToday = 0;
+  let overdue = 0;
+  let upcoming = 0;
+  let highPriority = 0;
+  let needsReview = 0;
+  let deadlines = 0;
+
+  for (const t of tasks) {
+    const status = (t.status || "pending").toLowerCase();
+    if (status === "pending") pending++;
+    else if (status === "completed") completed++;
+    else if (status === "cancelled") cancelled++;
+    else if (status === "superseded") superseded++;
+    else if (status === "dismissed") dismissed++;
+
+    const isArchived = ["completed", "cancelled", "superseded", "dismissed"].includes(status);
+
+    const st = (t.source_type || "whatsapp").toLowerCase();
+    if (sourceTypeCounts[st] !== undefined) {
+      sourceTypeCounts[st]++;
+    } else {
+      sourceTypeCounts[st] = 1;
+    }
+
+    if (t.category) {
+      categoryCounts[t.category] = (categoryCounts[t.category] || 0) + 1;
+    }
+    if (t.academic_intent) {
+      intentCounts[t.academic_intent] = (intentCounts[t.academic_intent] || 0) + 1;
+    }
+    if (t.priority && priorityCounts[t.priority.toUpperCase()] !== undefined) {
+      priorityCounts[t.priority.toUpperCase()]++;
+    }
+
+    // Active-only metrics to prevent inactive tasks from being counted as obligations
+    if (!isArchived) {
+      const isOvd =
+        (t.urgency === "CRITICAL" &&
+          (t.delta_days < 0 ||
+            (Array.isArray(t.urgency_reasons) &&
+              t.urgency_reasons.some((r) => r.toLowerCase().includes("overdue"))))) ||
+        (Boolean(t.due_date) && Boolean(todayStr) && t.due_date < todayStr);
+
+      const isToday =
+        (t.urgency === "CRITICAL" && t.delta_days === 0) ||
+        (Boolean(t.due_date) && Boolean(todayStr) && t.due_date === todayStr);
+
+      if (isOvd) overdue++;
+      if (isToday) dueToday++;
+      if (
+        t.due_date &&
+        (!todayStr || t.due_date > todayStr) &&
+        (t.delta_days === undefined || t.delta_days > 0)
+      ) {
+        upcoming++;
+      }
+      if (t.priority === "CRITICAL" || t.priority === "HIGH") {
+        highPriority++;
+      }
+      if (
+        Boolean(t.review_required) ||
+        t.date_status === "needs_review" ||
+        t.urgency === "NEEDS_REVIEW" ||
+        t.confidence === "LOW"
+      ) {
+        needsReview++;
+      }
+      if (t.due_date && (t.date_type || "").toLowerCase() === "deadline") {
+        deadlines++;
+      }
+    }
+  }
+
+  const active = pending;
+  const attentionRequired = overdue + dueToday + needsReview;
+
+  return {
+    total,
+    active,
+    pending,
+    completed,
+    cancelled,
+    superseded,
+    dismissed,
+    dueToday,
+    overdue,
+    upcoming,
+    highPriority,
+    needsReview,
+    deadlines,
+    attentionRequired,
+    categoryCounts,
+    priorityCounts,
+    intentCounts,
+    sourceTypeCounts,
+  };
 }
 
 /**

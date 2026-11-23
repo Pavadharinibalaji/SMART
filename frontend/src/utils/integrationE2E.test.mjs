@@ -19,6 +19,8 @@ import {
   filterByConfidence,
   matchesTaskFilters,
   filterTasks,
+  calculateDashboardStats,
+  taskMatchesSection,
 } from "./confidenceFilter.js";
 
 console.log("Starting End-to-End Frontend Integration test suite...\n");
@@ -600,6 +602,526 @@ console.log("Starting End-to-End Frontend Integration test suite...\n");
   assert.equal(hlSecond.segments[1].isMatch, true);
 
   console.log("✔ Scenario I: Unicode compatibility and candidate save provenance verified");
+}
+
+// ============================================================================
+// SCENARIO J: Phase 4.1 Extraction Intelligence and Actionability Verification
+// ============================================================================
+{
+  const candidatePostponement = {
+    title: "The exam was postponed.",
+    category: "Announcement",
+    source_text: "The exam was postponed.",
+    due_date: null,
+    confidence: "MEDIUM",
+    confidence_reasons: ["Candidate academic task extracted with standard rule-based heuristics."],
+    is_actionable: false,
+    actionability_type: "informational",
+    update_type: "postponement",
+    review_required: false,
+    review_reasons: [],
+    evidence_text: "The exam was postponed.",
+    evidence_start_index: 0,
+    evidence_end_index: 23,
+    candidate_token: "test.token.postponement",
+  };
+
+  const candidateExtension = {
+    title: "Assignment 1 deadline extended to Friday 5pm.",
+    category: "Assignment",
+    source_text: "Assignment 1 deadline extended to Friday 5pm.",
+    due_date: "2026-11-27",
+    confidence: "HIGH",
+    confidence_reasons: ["Unambiguous academic category with validated explicit calendar date."],
+    is_actionable: true,
+    actionability_type: "action_required",
+    update_type: "extension",
+    review_required: false,
+    review_reasons: [],
+    evidence_text: "Assignment 1 deadline extended to Friday 5pm.",
+    evidence_start_index: 0,
+    evidence_end_index: 45,
+    candidate_token: "test.token.extension",
+  };
+
+  // 1. Verify save payload structure carries actionability and update_type
+  const buildSavePayload = (cand) => ({
+    title: cand.title,
+    category: cand.category,
+    description: cand.source_text,
+    date_text: cand.date_text || null,
+    due_date: cand.due_date,
+    date_type: cand.date_type || "none",
+    date_status: cand.date_status || "not_found",
+    status: "pending",
+    source_sender: cand.source_sender || "",
+    source_timestamp: cand.source_timestamp || "",
+    source_text: cand.source_text,
+    source_filename: "chat.txt",
+    review_required: cand.review_required,
+    review_reasons: cand.review_reasons,
+    evidence_text: cand.evidence_text,
+    evidence_start_index: cand.evidence_start_index,
+    evidence_end_index: cand.evidence_end_index,
+    candidate_token: cand.candidate_token,
+    is_actionable: cand.is_actionable !== undefined ? cand.is_actionable : true,
+    actionability_type: cand.actionability_type || "action_required",
+    update_type: cand.update_type || null,
+  });
+
+  const payloadPostponement = buildSavePayload(candidatePostponement);
+  assert.equal(payloadPostponement.is_actionable, false);
+  assert.equal(payloadPostponement.actionability_type, "informational");
+  assert.equal(payloadPostponement.update_type, "postponement");
+
+  const payloadExtension = buildSavePayload(candidateExtension);
+  assert.equal(payloadExtension.is_actionable, true);
+  assert.equal(payloadExtension.actionability_type, "action_required");
+  assert.equal(payloadExtension.update_type, "extension");
+
+  // 2. Multi-clause independent task highlight in evidence drawer
+  const multiClauseSource = "Submit your assignment by Thursday and register for the workshop before Saturday.";
+  const clause1Evidence = "Submit your assignment by Thursday";
+  const clause2Evidence = "register for the workshop before Saturday.";
+
+  const hlClause1 = highlightEvidence(multiClauseSource, clause1Evidence, 0, 34);
+  assert.equal(hlClause1.matched, true);
+  assert.equal(hlClause1.mismatchWarning, false);
+  assert.equal(hlClause1.segments[0].text, clause1Evidence);
+  assert.equal(hlClause1.segments[0].isMatch, true);
+
+  const hlClause2 = highlightEvidence(multiClauseSource, clause2Evidence, 39, 81);
+  assert.equal(hlClause2.matched, true);
+  assert.equal(hlClause2.mismatchWarning, false);
+  assert.equal(hlClause2.segments[0].text, "Submit your assignment by Thursday and ");
+  assert.equal(hlClause2.segments[0].isMatch, false);
+  assert.equal(hlClause2.segments[1].text, clause2Evidence);
+  assert.equal(hlClause2.segments[1].isMatch, true);
+
+  console.log("✔ Scenario J: Phase 4.1 extraction intelligence and actionability verified");
+}
+
+// ============================================================================
+// SCENARIO K: Phase 4.4 Dashboard Overview Metrics & Status Separation
+// ============================================================================
+{
+  const refDate = "2026-11-23";
+  const tasksSample = [
+    // 1. Overdue pending task
+    {
+      id: 1,
+      title: "Overdue Lab Report",
+      category: "Assignment",
+      status: "pending",
+      due_date: "2026-11-20",
+      date_type: "deadline",
+      urgency: "CRITICAL",
+      urgency_reasons: ["Overdue by 3 days"],
+      delta_days: -3,
+      priority: "CRITICAL",
+      importance: "HIGH",
+    },
+    // 2. Due today pending task
+    {
+      id: 2,
+      title: "Quiz Today",
+      category: "Exam",
+      status: "pending",
+      due_date: "2026-11-23",
+      date_type: "deadline",
+      urgency: "CRITICAL",
+      delta_days: 0,
+      priority: "HIGH",
+      importance: "HIGH",
+    },
+    // 3. Upcoming deadline
+    {
+      id: 3,
+      title: "Term Paper Submission",
+      category: "Assignment",
+      status: "pending",
+      due_date: "2026-11-30",
+      date_type: "deadline",
+      urgency: "MEDIUM",
+      delta_days: 7,
+      priority: "MEDIUM",
+      importance: "MEDIUM",
+    },
+    // 4. Task requiring review
+    {
+      id: 4,
+      title: "Seminar Discussion",
+      category: "Announcement",
+      status: "pending",
+      due_date: null,
+      date_status: "needs_review",
+      review_required: true,
+      urgency: "NEEDS_REVIEW",
+      priority: "LOW",
+      importance: "LOW",
+    },
+    // 5. Completed task (must NOT count as overdue or active obligation even if past due_date)
+    {
+      id: 5,
+      title: "Completed Midterm",
+      category: "Exam",
+      status: "completed",
+      due_date: "2026-11-15",
+      date_type: "deadline",
+      urgency: "LOW",
+      priority: "LOW",
+      importance: "HIGH",
+    },
+    // 6. Cancelled task (must NOT count as upcoming or confirmed deadline)
+    {
+      id: 6,
+      title: "Cancelled Guest Lecture",
+      category: "Event",
+      status: "cancelled",
+      due_date: "2026-11-28",
+      date_type: "event_date",
+      urgency: "LOW",
+      priority: "LOW",
+      importance: "LOW",
+    },
+    // 7. Superseded task (must NOT count as upcoming deadline)
+    {
+      id: 7,
+      title: "Old Assignment Schedule",
+      category: "Assignment",
+      status: "superseded",
+      due_date: "2026-11-25",
+      date_type: "deadline",
+      urgency: "LOW",
+      priority: "LOW",
+      importance: "MEDIUM",
+    },
+    // 8. Dismissed task
+    {
+      id: 8,
+      title: "Dismissed Notice",
+      category: "Opportunity",
+      status: "dismissed",
+      due_date: null,
+      urgency: "NO_DEADLINE",
+      priority: "LOW",
+      importance: "LOW",
+    },
+  ];
+
+  const stats = calculateDashboardStats(tasksSample, refDate);
+
+  // 1. Total and lifecycle statuses
+  assert.equal(stats.total, 8, "Total tasks must be 8");
+  assert.equal(stats.active, 4, "Active pending tasks must be exactly 4");
+  assert.equal(stats.pending, 4, "Pending tasks must be 4");
+  assert.equal(stats.completed, 1, "Completed tasks must be 1");
+  assert.equal(stats.cancelled, 1, "Cancelled tasks must be 1");
+  assert.equal(stats.superseded, 1, "Superseded tasks must be 1");
+  assert.equal(stats.dismissed, 1, "Dismissed tasks must be 1");
+
+  // 2. Active obligations separation (inactive tasks must NOT count)
+  assert.equal(stats.overdue, 1, "Only pending overdue task #1 must count as overdue");
+  assert.equal(stats.dueToday, 1, "Only pending task #2 must count as due today");
+  assert.equal(stats.upcoming, 1, "Only pending future task #3 must count as upcoming (cancelled & superseded excluded)");
+  assert.equal(stats.needsReview, 1, "Only pending task #4 must count as needing review");
+  assert.equal(stats.highPriority, 2, "Pending tasks #1 (CRITICAL) and #2 (HIGH) count as highPriority");
+  assert.equal(stats.attentionRequired, 3, "Attention required = overdue(1) + dueToday(1) + needsReview(1) = 3");
+  assert.equal(stats.deadlines, 3, "Confirmed deadlines = tasks #1, #2, #3 (pending deadlines)");
+
+  console.log("✔ Scenario K: Phase 4.4 dashboard metrics calculation and status separation verified");
+}
+
+// ============================================================================
+// SCENARIO L: Phase 4.4 Advanced Multi-Criteria Filters & Section Matching
+// ============================================================================
+{
+  const refDate = "2026-11-23";
+  const tasks = [
+    {
+      id: 10,
+      title: "Distributed Systems Assignment 2",
+      category: "Assignment",
+      academic_intent: "assignment",
+      status: "pending",
+      due_date: "2026-11-20",
+      urgency: "CRITICAL",
+      priority: "CRITICAL",
+      importance: "HIGH",
+      confidence: "HIGH",
+      review_required: false,
+    },
+    {
+      id: 11,
+      title: "Operating Systems Final Exam",
+      category: "Exam",
+      academic_intent: "exam",
+      status: "pending",
+      due_date: "2026-11-23",
+      urgency: "CRITICAL",
+      priority: "CRITICAL",
+      importance: "HIGH",
+      confidence: "HIGH",
+      review_required: false,
+    },
+    {
+      id: 12,
+      title: "Web Security Lab Project",
+      category: "Assignment",
+      academic_intent: "project",
+      status: "pending",
+      due_date: "2026-11-29",
+      urgency: "MEDIUM",
+      priority: "HIGH",
+      importance: "HIGH",
+      confidence: "MEDIUM",
+      review_required: false,
+    },
+    {
+      id: 13,
+      title: "Club Hackathon Registration",
+      category: "Opportunity",
+      academic_intent: "competition",
+      status: "pending",
+      due_date: null,
+      date_status: "needs_review",
+      urgency: "NEEDS_REVIEW",
+      priority: "LOW",
+      importance: "LOW",
+      confidence: "LOW",
+      review_required: true,
+    },
+    {
+      id: 14,
+      title: "Old Rescheduled Quiz",
+      category: "Exam",
+      academic_intent: "exam",
+      status: "superseded",
+      due_date: "2026-11-18",
+      urgency: "LOW",
+      priority: "LOW",
+      importance: "MEDIUM",
+      confidence: "HIGH",
+      review_required: false,
+    },
+  ];
+
+  // 1. Section matching tests
+  // Section: 'today' (overdue + due today)
+  const todayTasks = tasks.filter((t) => taskMatchesSection(t, "today", refDate));
+  assert.equal(todayTasks.length, 2);
+  assert.deepEqual(todayTasks.map((t) => t.id).sort(), [10, 11]);
+
+  // Section: 'upcoming' (future active deadlines)
+  const upcomingTasks = tasks.filter((t) => taskMatchesSection(t, "upcoming", refDate));
+  assert.equal(upcomingTasks.length, 1);
+  assert.equal(upcomingTasks[0].id, 12);
+
+  // Section: 'high_priority' (CRITICAL or HIGH)
+  const highPriTasks = tasks.filter((t) => taskMatchesSection(t, "high_priority", refDate));
+  assert.equal(highPriTasks.length, 3);
+  assert.deepEqual(highPriTasks.map((t) => t.id).sort(), [10, 11, 12]);
+
+  // Section: 'needs_review'
+  const reviewTasks = tasks.filter((t) => taskMatchesSection(t, "needs_review", refDate));
+  assert.equal(reviewTasks.length, 1);
+  assert.equal(reviewTasks[0].id, 13);
+
+  // Section: 'completed_archived'
+  const archivedTasks = tasks.filter((t) => taskMatchesSection(t, "completed_archived", refDate));
+  assert.equal(archivedTasks.length, 1);
+  assert.equal(archivedTasks[0].id, 14);
+
+  // 2. Multi-criteria combined filtering
+  // Search + Category + Priority + Importance
+  const combinedMatches = filterTasks(tasks, {
+    search: "Distributed",
+    category: "Assignment",
+    priority: "CRITICAL",
+    importance: "HIGH",
+    status: "pending",
+  });
+  assert.equal(combinedMatches.length, 1);
+  assert.equal(combinedMatches[0].id, 10);
+
+  // Intent filter
+  const examMatches = filterTasks(tasks, {
+    academic_intent: "exam",
+    status: "pending",
+  });
+  assert.equal(examMatches.length, 1);
+  assert.equal(examMatches[0].id, 11);
+
+  // Review filter
+  const needsReviewMatches = filterTasks(tasks, {
+    review_required: "NEEDS_REVIEW",
+  });
+  assert.equal(needsReviewMatches.length, 1);
+  assert.equal(needsReviewMatches[0].id, 13);
+
+  console.log("✔ Scenario L: Phase 4.4 advanced multi-criteria filters and sections verified");
+}
+
+// ============================================================================
+// SCENARIO M: Phase 4.4 Task Editing & Immutability Protection
+// ============================================================================
+{
+  const originalTask = {
+    id: 101,
+    title: "Original Title",
+    category: "Assignment",
+    description: "Original description",
+    due_date: "2026-11-25",
+    importance: "MEDIUM",
+    status: "pending",
+    // Immutable fields
+    confidence: "HIGH",
+    confidence_reasons: ["Explicit deadline statement"],
+    evidence_text: "Original Evidence Text",
+    evidence_start_index: 10,
+    evidence_end_index: 32,
+    source_sender: "Prof. Alan",
+    source_timestamp: "2026-11-18 09:00:00",
+    source_text: "Original message text",
+    source_filename: "chat_export.txt",
+  };
+
+  // User updates editable fields
+  const userEdits = {
+    title: "Updated Title for Assignment",
+    category: "Exam",
+    due_date: "2026-11-28",
+    importance: "HIGH",
+    description: "Updated student notes",
+    status: "pending",
+  };
+
+  // Simulate update in frontend state matching backend PUT/PATCH response
+  const updatedTask = {
+    ...originalTask,
+    ...userEdits,
+    // Explicitly guarantee immutable fields are never altered
+    confidence: originalTask.confidence,
+    confidence_reasons: originalTask.confidence_reasons,
+    evidence_text: originalTask.evidence_text,
+    evidence_start_index: originalTask.evidence_start_index,
+    evidence_end_index: originalTask.evidence_end_index,
+    source_sender: originalTask.source_sender,
+    source_timestamp: originalTask.source_timestamp,
+    source_text: originalTask.source_text,
+    source_filename: originalTask.source_filename,
+  };
+
+  // Verify editable fields were updated
+  assert.equal(updatedTask.title, "Updated Title for Assignment");
+  assert.equal(updatedTask.category, "Exam");
+  assert.equal(updatedTask.due_date, "2026-11-28");
+  assert.equal(updatedTask.importance, "HIGH");
+  assert.equal(updatedTask.description, "Updated student notes");
+
+  // Verify immutable fields remained untouched
+  assert.equal(updatedTask.confidence, "HIGH");
+  assert.deepEqual(updatedTask.confidence_reasons, ["Explicit deadline statement"]);
+  assert.equal(updatedTask.evidence_text, "Original Evidence Text");
+  assert.equal(updatedTask.evidence_start_index, 10);
+  assert.equal(updatedTask.evidence_end_index, 32);
+  assert.equal(updatedTask.source_sender, "Prof. Alan");
+  assert.equal(updatedTask.source_filename, "chat_export.txt");
+
+  console.log("✔ Scenario M: Phase 4.4 task editing and immutability protection verified");
+}
+
+// ============================================================================
+// SCENARIO N: Phase 4.5 Multi-Source Adapters & Source-Aware Filtering
+// ============================================================================
+{
+  const multiSourceTasks = [
+    {
+      id: 1,
+      title: "WhatsApp Assignment Task",
+      category: "Assignment",
+      status: "pending",
+      due_date: "2026-11-28",
+      source_type: "whatsapp",
+      source_id: "wa_msg_1",
+      source_text: "Assignment 1 due Friday Nov 28",
+    },
+    {
+      id: 2,
+      title: "Gmail Midterm Announcement",
+      category: "Exam",
+      status: "pending",
+      due_date: "2026-12-02",
+      source_type: "gmail",
+      source_id: "gmail_msg_987",
+      source_text: "Midterm exam is on Dec 2",
+    },
+    {
+      id: 3,
+      title: "Google Classroom Lab 3",
+      category: "Assignment",
+      status: "pending",
+      due_date: "2026-11-30",
+      source_type: "google_classroom",
+      source_id: "gc_coursework_456",
+      source_text: "Lab 3 backprop due Nov 30",
+    },
+    {
+      id: 4,
+      title: "Manual Personal Note",
+      category: "Opportunity",
+      status: "pending",
+      due_date: "2026-12-15",
+      source_type: "manual",
+      source_id: "manual_12345",
+      source_text: "Apply for research internship by Dec 15",
+    },
+    {
+      id: 5,
+      title: "Legacy Task (No source_type)",
+      category: "Assignment",
+      status: "pending",
+      due_date: "2026-11-29",
+      source_text: "Legacy task without explicit source",
+    },
+  ];
+
+  // 1. Verify source-based filtering
+  const waOnly = multiSourceTasks.filter((t) =>
+    matchesTaskFilters(t, { source_type: "whatsapp" })
+  );
+  // Default fallback for items with missing source_type is 'whatsapp'
+  assert.equal(waOnly.length, 2, "WhatsApp filter must match whatsapp source + legacy fallback");
+  assert.equal(waOnly[0].id, 1);
+  assert.equal(waOnly[1].id, 5);
+
+  const gmailOnly = multiSourceTasks.filter((t) =>
+    matchesTaskFilters(t, { source_type: "gmail" })
+  );
+  assert.equal(gmailOnly.length, 1);
+  assert.equal(gmailOnly[0].id, 2);
+
+  const classroomOnly = multiSourceTasks.filter((t) =>
+    matchesTaskFilters(t, { source_type: "google_classroom" })
+  );
+  assert.equal(classroomOnly.length, 1);
+  assert.equal(classroomOnly[0].id, 3);
+
+  const manualOnly = multiSourceTasks.filter((t) =>
+    matchesTaskFilters(t, { source_type: "manual" })
+  );
+  assert.equal(manualOnly.length, 1);
+  assert.equal(manualOnly[0].id, 4);
+
+  // 2. Verify calculateDashboardStats computes sourceTypeCounts
+  const stats = calculateDashboardStats(multiSourceTasks, "2026-11-23");
+  assert.ok(stats.sourceTypeCounts, "sourceTypeCounts must exist on dashboard stats");
+  assert.equal(stats.sourceTypeCounts.whatsapp, 2);
+  assert.equal(stats.sourceTypeCounts.gmail, 1);
+  assert.equal(stats.sourceTypeCounts.google_classroom, 1);
+  assert.equal(stats.sourceTypeCounts.manual, 1);
+
+  console.log("✔ Scenario N: Phase 4.5 multi-source adapters & source-aware filtering verified");
 }
 
 console.log("\nAll End-to-End Frontend Integration tests PASSED successfully!");

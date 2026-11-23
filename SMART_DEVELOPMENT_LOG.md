@@ -1016,3 +1016,342 @@ Perform an in-depth security and correctness audit of the Phase 3.3.1 implementa
   - `npm --prefix frontend run build`: Clean Vite build in 426ms.
 - **Git Whitespace Check (`git diff --check`):** Clean (0 errors).
 
+
+
+---
+
+## SMART 2.0 — Phase 4: Academic Communication Intelligence & Integration Readiness
+
+### Phase 4.1: Category-Clause Extraction & Actionability Intelligence
+- Implemented clause-level segmentation with delimiter preservation and multi-obligation extraction.
+- Introduced `is_actionable` boolean and `actionability_type` classification (`action_required`, `informational`, `unassessed`).
+- Enforced additive, idempotent migrations in SQLite with legacy announcement safety.
+
+### Phase 4.2: Temporal Semantics & Deadline Provenance Intelligence
+- Relative date anchoring: resolved relative weekdays ("by Monday", "before Monday", "next Friday", "tomorrow") strictly relative to message timestamps.
+- Explicit clock-time extraction: 12-hour/24-hour time detection (`deadline_time`) with midnight boundaries.
+- Date ranges and ambiguity tracking: ISO date intervals (`YYYY-MM-DD/YYYY-MM-DD`), `is_range`, `needs_review` statuses.
+- Deadline modification intelligence: detect extensions, postponements, cancellations, and revisions, linking to existing tasks via `replaces_task_id` and updating statuses to `superseded` or `cancelled`.
+
+### Phase 4.3: Academic Context & Intelligent Prioritization
+- Deterministic explainable prioritization in `backend/prioritization.py`:
+  - Priority levels: `CRITICAL`, `HIGH`, `MEDIUM`, `LOW`.
+  - Urgency levels: `CRITICAL`, `HIGH`, `MEDIUM`, `LOW`, `NO_DEADLINE`, `NEEDS_REVIEW` with exact `delta_days`.
+  - Importance levels: `HIGH`, `MEDIUM`, `LOW`, `UNASSESSED`.
+  - Academic intent: 12 standardized intents.
+  - Transparent rationales (`priority_reasons`, `urgency_reasons`).
+
+### Phase 4.4: Intelligent Academic Dashboard
+- Overview layout featuring metrics, attention callout, and workload distribution bars.
+- Structured section views: Today & Overdue, Upcoming, High Priority, Needs Review, Completed & Archived, All Tasks.
+- Modals for task editing (`EditTaskModal`) and task relationships (`TaskRelationshipsModal`).
+
+---
+
+## Phase 4.5: Integration Readiness
+
+### 1. Objective & Scope
+Prepare SMART 2.0 to support multiple academic communication sources (WhatsApp, Gmail, Google Classroom, and Manual Entry) without implementing complete external OAuth integrations. Decouple source-specific ingestion formats from the core intelligence, temporal parsing, prioritization, and provenance verification pipeline, ensuring seamless future source additions while maintaining full backward compatibility.
+
+### 2. Architecture & Design Implementation
+
+#### 2.1 Common Normalized Source Message Representation (`backend/source_adapters.py`)
+- **`SourceMessage` Dataclass:**
+  - `source_type`: Platform identifier (`whatsapp`, `gmail`, `google_classroom`, `manual`).
+  - `source_id`: Platform-stable message ID (e.g. Gmail Message-ID, Classroom coursework ID, or deterministic hash).
+  - `source_sender`: Sender display name or institutional address.
+  - `source_timestamp`: Original message timestamp string.
+  - `source_text`: Message body / textual content.
+  - `source_filename`: Origin filename where applicable.
+  - `source_metadata`: Extensible metadata dictionary for platform headers.
+  - `message_id`: Sequential integer for intra-batch tracking.
+  - Serializers: `to_dict()` and `from_dict()`.
+
+#### 2.2 Lightweight Adapter Architecture (`backend/source_adapters.py`)
+- **`SourceAdapter`:** Abstract base class defining `source_type` and `parse(raw_input, **kwargs) -> list[SourceMessage]`.
+- **`WhatsAppAdapter`:** Wraps existing regex parser in `parser.py`, generating stable message IDs and preserving source text and metadata.
+- **`GmailAdapter`:** Parses structured JSON payloads (Gmail API format: `id`, `sender`, `subject`, `internalDate`, `snippet`, `body`, `threadId`, `labels`) or raw RFC 2822 email strings with header extraction (`From:`, `Subject:`, `Date:`).
+- **`GoogleClassroomAdapter`:** Ingests coursework objects and announcements (`id`, `title`, `description`, `dueDate`, `dueTime`, `creatorUserId`, `courseId`, `alternateLink`), identifying coursework intent and formatting explicit deadline strings.
+- **`ManualAdapter`:** Handles direct student pasted text or manual entry forms, assigning deterministic timestamps and local identifiers.
+- **Registry & Extensibility:** `get_source_adapter(source_type)` and `register_source_adapter(adapter)` enabling runtime expansion.
+
+#### 2.3 Extraction Pipeline Decoupling & HMAC Binding (`backend/extractor.py`, `backend/main.py`)
+- **Extractor Interoperability:** `extract_academic_items()` extracts academic items from normalized message dicts or `SourceMessage` objects, propagating `source_type`, `source_id`, and `source_metadata` onto all extracted candidate items.
+- **Cryptographic Provenance Protection:** `create_candidate_token()` HMAC binds `source_type` and `source_id` alongside `source_text`, `category`, and offsets.
+- **Authoritative Server Enforcement:** During `POST /api/academic-items`, the server validates the candidate HMAC token and authoritatively overrides client-supplied `source_type` and `source_id` with signed token values, preventing client spoofing of source origins.
+
+#### 2.4 Database Persistence & Additive Migrations (`backend/database.py`)
+- **Additive Migration:**
+  - Added `source_type TEXT DEFAULT 'whatsapp'`, `source_id TEXT`, and `source_metadata TEXT` columns to `academic_items`.
+  - Non-destructive `PRAGMA table_info` checks ensure existing tables receive the new columns without data loss.
+  - Created composite index `idx_academic_items_source ON academic_items(source_type, source_id)`.
+  - Protected `source_type`, `source_id`, and `source_metadata` in `IMMUTABLE_FIELDS`.
+- **Intelligent Deduplication:**
+  - Fast-path deduplication: When a stable external `source_id` exists, items are deduplicated on `(source_type, source_id, category)`.
+  - Fallback deduplication: For items lacking stable external IDs (e.g. WhatsApp exports), deduplication matches on `(source_text, source_timestamp, source_sender, source_filename, source_type, category)`.
+- **Source Filtering:** `list_academic_items()` supports `source_type: Optional[str] = None` query filtering.
+
+#### 2.5 Multi-Source Extraction Endpoint (`backend/main.py`)
+- `POST /api/extract-academic-source`: Accepts `source_type`, `raw_text`, `payload`, `filename`, `sender`, and `timestamp`, automatically selecting the corresponding adapter, parsing the input into `SourceMessage` objects, running academic extraction, and returning formatted candidate items.
+
+#### 2.6 Frontend Multi-Source Experience (`frontend/src/`)
+- **API Client (`frontend/src/api.js`):** Added `extractAcademicFromSource(sourcePayload)` and `source_type` query serialization in `getAcademicItems(filters)`.
+- **Filtering Utilities (`frontend/src/utils/confidenceFilter.js`):**
+  - Added `ALLOWED_SOURCE_TYPES` and `SOURCE_TYPE_OPTIONS`.
+  - Updated `matchesTaskFilters(task, filters)` to support `filters.source_type`.
+  - Updated `calculateDashboardStats(tasks)` to calculate `sourceTypeCounts`.
+- **Analyze Interface (`frontend/src/App.jsx`, `frontend/src/App.css`):**
+  - Added Source Switcher tabs in Analyze view:
+    - 💬 WhatsApp: Active file dropzone workflow.
+    - ✉️ Gmail: Integration Preview card highlighting upcoming direct OAuth inbox sync.
+    - 🏫 Google Classroom: Integration Preview card highlighting upcoming course sync.
+    - ✍️ Manual Text: Active textarea and "Analyze Manual Text" action for instant note analysis.
+- **Card Badges & Workspace Filtering:**
+  - Candidate cards and saved task cards render distinct source badges (`💬 WhatsApp`, `✉️ Gmail`, `🏫 Classroom`, `✍️ Manual`).
+  - Added `Source:` filter pills (`ALL`, `WhatsApp`, `Gmail`, `Classroom`, `Manual`) to task filters.
+
+---
+
+### 3. Verification & Quality Gates
+
+- **Backend Pytest Suite (`py -m pytest -q`):**
+  - **275 passed, 1 warning** (100% pass rate across all 9 test suites).
+  - 13 new integration tests in `backend/tests/test_phase4_integration_readiness.py`.
+- **Frontend Test Suite (`npm --prefix frontend test`):**
+  - **84 tests passing** across 4 suites (+Scenario N in `integrationE2E.test.mjs`).
+- **Frontend Code Quality & Production Build:**
+  - `npm --prefix frontend run lint`: 0 errors, 0 warnings.
+  - `npm --prefix frontend run build`: Clean production build.
+- **Git Whitespace Check (`git diff --check`):** Clean (0 whitespace errors).
+- **Version Control Constraints:** Maintained on `feature/smart-v2-intelligence`; no git commit or git push executed.
+
+
+---
+
+## [Phase 4.6] — Quality, Security & Production Readiness
+
+**Date:** 2026-11-23
+**Branch:** `feature/smart-v2-intelligence`
+**Status:** Completed & Fully Verified
+
+### 1. Objectives & Overview
+Solidified SMART 2.0 for production readiness and academic demonstration:
+1. **Multi-Task Deduplication Correction:** Resolved the flaw where fast-path deduplication on `(source_type, source_id, category)` mistakenly rejected independent tasks extracted from the same message (e.g. multiple assignments announced in a single email or post), while maintaining strict `409 Conflict` duplicate protection for re-saving the exact same task candidate.
+2. **Source Metadata Integrity & Security:** Prevented client spoofing of platform provenance (`gmail`, `google_classroom`) by requiring valid candidate tokens, cryptographically binding `source_metadata` into HMAC candidate signatures, and ensuring pipeline-certified metadata authoritatively overrides client payloads.
+3. **Adapter Reliability:** Hardened all adapters (`WhatsAppAdapter`, `GmailAdapter`, `GoogleClassroomAdapter`, `ManualAdapter`) against empty, malformed, non-dict payloads and missing headers, safely skipping unparsable items without throwing unhandled exceptions.
+4. **Persistence Transactional Safety:** Guaranteed atomic execution of task association state transitions (`superseded`, `cancelled`) and new task insertion within a single SQLite immediate transaction (`save_academic_item_with_association`), ensuring zero orphaned or partially mutated state on duplicate detection or database errors.
+5. **Deployment & Environment Configuration:** Created `.env.example` and overhauled `README.md` with complete architecture diagrams, technology stack, setup commands, verification commands, and security guidelines.
+
+---
+
+### 2. Detailed Implementation
+
+#### 2.1 Multi-Task Deduplication (`backend/database.py`)
+- Enhanced `find_duplicate_item()` with `title`, `evidence_text`, and `evidence_start_index` parameters.
+- In both fast-path (`source_id`) and fallback (`source_text`) queries:
+  - Candidates sharing `(source_type, source_id, category)` are compared on task distinguishing attributes (`evidence_start_index`, `title`, or `evidence_text`).
+  - Distinct task clauses within the same announcement (e.g. Assignment 1 and Assignment 2) can coexist and persist successfully.
+  - Re-submitting the exact same candidate triggers a clean `409 Conflict` reporting the existing task ID.
+
+#### 2.2 Source Provenance & Security Hardening (`backend/extractor.py`, `backend/main.py`)
+- In `backend/extractor.py`:
+  - Included `"source_metadata": candidate.get("source_metadata") or {}` in `create_candidate_token()` signed HMAC payload.
+  - Added `re.compile(r"\bproblem\s+sets?\b", re.I)` to `CATEGORY_PATTERNS["Assignment"]` to reliably capture coursework problem sets.
+- In `backend/main.py`:
+  - When saving items, if `candidate_token` is missing and `source_type` is an external platform (`gmail`, `google_classroom`), rejected with HTTP 400.
+  - Verified candidate token metadata authoritatively overrides any untrusted client-supplied `source_metadata`.
+  - Re-ordered deduplication check to execute *before* mutating any target task states.
+
+#### 2.3 Transactional Association Safety (`backend/database.py`, `backend/main.py`)
+- Added `save_academic_item_with_association(new_item, target_id, update_reasons, new_status, conn)`:
+  - Uses `BEGIN IMMEDIATE;` transaction to update the target predecessor task status (`superseded` or `cancelled`) and insert the new academic item atomically.
+  - Automatically rolls back on any error, eliminating partial state risks.
+
+#### 2.4 Adapter Fault Tolerance (`backend/source_adapters.py`)
+- Implemented `SourceMessage.from_dict()` for robust deserialization.
+- Enhanced `GmailAdapter.parse()` with RFC header parsing (`From:`, `Date:`, `Subject:`) for raw email text inputs.
+- Enhanced `GoogleClassroomAdapter.parse()` to recognize coursework containers, `dueDate` objects, and coursework keyword titles, setting `source_metadata["item_type"] = "coursework"`.
+- Guaranteed empty strings, empty arrays, or malformed JSON payloads return empty message lists without throwing 500 server errors.
+
+#### 2.5 Documentation & Configuration
+- Created `.env.example` detailing `HOST`, `PORT`, `SMART_DB_PATH`, `SMART_PROVENANCE_SECRET`, and `VITE_API_URL`.
+- Completely rewrote `README.md` to reflect the comprehensive SMART 2.0 system architecture, multi-source ingestion, temporal intelligence, prioritization matrix, API reference, verification commands, and production considerations.
+
+---
+
+### 3. Verification & Quality Gates
+
+- **Backend Pytest Suite (`py -m pytest -q`):**
+  - **281 passed, 1 warning** across all 10 test modules.
+  - Added 6 dedicated Phase 4.6 regression tests in `backend/tests/test_phase4_integration_readiness.py`:
+    - `test_multi_task_deduplication_same_gmail_message`
+    - `test_multi_task_deduplication_same_whatsapp_message`
+    - `test_security_untrusted_manual_cannot_forge_platform_provenance`
+    - `test_security_candidate_token_source_metadata_cannot_be_overridden`
+    - `test_transactional_association_safety`
+    - `test_adapter_empty_and_malformed_resilience`
+- **Frontend Test Suite (`npm --prefix frontend test -- --run`):**
+  - **84 passed** across 4 test suites (100% pass rate).
+- **Frontend Static Analysis (`npm --prefix frontend run lint`):**
+  - **0 errors, 0 warnings**.
+- **Frontend Production Asset Build (`npm --prefix frontend run build`):**
+  - Clean Vite build with optimized chunks.
+- **Git Whitespace Integrity (`git diff --check`):**
+  - Clean (0 whitespace errors).
+- **Branch & Constraints:**
+  - Active branch: `feature/smart-v2-intelligence`.
+  - Zero git commits or pushes executed.
+  - Local database file `smart.db` preserved intact.
+
+
+---
+
+## Phase SMART 2.1: Academic Automation & Integrations
+
+**Date:** 2026-11-23
+**Status:** Completed
+**Branch:** `feature/smart-2.1-academic-automation`
+**Test Suite:** 292/292 Pytest tests passing (100%), 84/84 Frontend tests passing (100%), 0 ESLint errors, clean Vite build.
+
+### 1. Objective & Scope
+Upgrade SMART 2.0 to **SMART 2.1 — Academic Automation & Integrations**:
+1. **Gmail Integration:** OAuth 2.0 authorization, reversible Fernet token encryption, manual sync action, academic announcement and competition discovery, attachment metadata extraction, deduplication via message IDs.
+2. **Competition Discovery & Student Tracking:** Dedicated opportunities entity, multi-attribute extraction without hallucination, 8 explicit student participation states (`discovered`, `interested`, `registration_pending`, `registered`, `declined`, `attended`, `not_attended`, `expired`), authorized teacher overview.
+3. **Google Classroom & Progress Tracking:** Read-only access to courses, coursework, and submission states (`NEW`, `CREATED`, `TURNED_IN`, `RETURNED`, grades) for students, and course-scoped progress monitoring for teachers.
+4. **Study Materials Repository:** Consolidated view of Gmail attachments and Classroom files.
+5. **Security & Authorization:** Symmetric reversible token encryption (never hashed), state CSRF tokens with replay prevention, backend endpoint role authorization checks (HTTP 403 for unauthorized roles), offline demo data mode isolation (`is_demo = 1`).
+
+### 2. Files Modified and Created
+
+#### Backend:
+- `backend/security.py` (Created):
+  - Symmetric authenticated encryption (`Fernet`) for Google access and refresh tokens.
+  - Ephemeral runtime key fallback when `SMART_TOKEN_ENCRYPTION_KEY` is not provided.
+  - HMAC-SHA256 OAuth CSRF state token generation and timestamp expiration validation.
+  - Token sanitization helper preventing token leakage in API responses.
+- `backend/competition_extractor.py` (Created):
+  - Deterministic competition regex patterns avoiding cross-line greediness.
+  - Extracts title, organizer, eligibility, deadline, event date, registration link, and evidence without inventing absent fields.
+- `backend/google_service.py` (Created):
+  - OAuth authorization URL generator, token exchange, token refresh.
+  - Live Gmail and Google Classroom read-only fetchers using `httpx`.
+  - Comprehensive demo data seeding engine with explicit `is_demo=1` tagging for offline testing.
+- `backend/database.py` (Modified):
+  - Additive migration `'smart_2_1_tables'` creating: `google_accounts`, `opportunities`, `student_opportunity_statuses`, `classroom_courses`, `classroom_coursework`, `classroom_submissions`, `study_materials`.
+  - CRUD functions for all SMART 2.1 entities with parameterization and isolation.
+- `backend/main.py` (Modified):
+  - Registered 12 new endpoints for Google Auth, Gmail Sync, Classroom Sync, Opportunities, Materials, and Teacher Overviews.
+  - Strict role authorization enforcement on teacher endpoints (`X-User-Role: teacher`).
+- `backend/requirements.txt` (Modified):
+  - Added `cryptography>=42.0.0`.
+- `backend/tests/test_phase2_1_automation.py` (Created):
+  - 7 comprehensive tests covering token security, sanitization, CSRF tokens, non-inventing extractor, student isolation, teacher authorization, and demo mode.
+
+#### Frontend:
+- `frontend/src/api.js` (Modified):
+  - Added client methods for Google OAuth URL, status, disconnect, demo toggle, sync Gmail, sync Classroom, opportunities CRUD, classroom progress, study materials, and teacher overviews.
+- `frontend/src/components/OpportunityExplorer.jsx` (Created):
+  - Opportunities cards grid, status filtering pills, interactive registration status dropdown, external link navigation, demo badge.
+- `frontend/src/components/ClassroomProgress.jsx` (Created):
+  - Interactive course selection tiles, coursework assignments table, submission status badges, grades, Classroom sync trigger.
+- `frontend/src/components/StudyMaterialsView.jsx` (Created):
+  - Unified index of Gmail attachments and Classroom files, file size formatting, direct links.
+- `frontend/src/components/TeacherDashboard.jsx` (Created):
+  - Role-protected teacher view displaying course submissions breakdown and student competition participation table.
+- `frontend/src/components/Sidebar.jsx` (Modified):
+  - Added local demonstration role perspective switcher (Student / Teacher).
+  - Added navigation items for Opportunities, Classroom, Study Materials, and Teacher View.
+  - Added Google account connection status and quick sync triggers.
+- `frontend/src/components/Topbar.jsx` (Modified):
+  - Added perspective badge and "Connect Google" button with status indicator and disconnect modal.
+- `frontend/src/App.jsx` (Modified):
+  - Integrated state management, loaders, and views for all SMART 2.1 tabs.
+- `frontend/src/App.css` (Modified):
+  - Modern styling matching the purple SaaS design system for all new components.
+
+### 3. Verification & Acceptance
+- **Linting:** `npm --prefix frontend run lint` passed with 0 errors and 0 warnings.
+- **Frontend Build:** `npm --prefix frontend run build` succeeded cleanly with Vite.
+- **Frontend Tests:** `npm --prefix frontend test` passed all 84 test cases.
+- **Backend Tests:** `py -m pytest -q` passed all 288 test cases (including all 7 SMART 2.1 tests).
+- **Git Whitespace:** `git diff --check` reported 0 whitespace errors.
+
+
+---
+
+## SMART 2.1 — Frontend UI Layout Repair & Verification Milestone
+
+### 1. Root Cause Analysis
+During browser testing following authentication, the authenticated workspace rendered as a partially unstyled page where sidebar navigation items displayed as an unbulleted/bulleted HTML `<ul>` list, buttons appeared with browser-default grey borders and background, and topbar/content components were misaligned.
+
+**Inspection Findings:**
+- When the SaaS purple dashboard redesign components (`Sidebar.jsx`, `Topbar.jsx`, `DashboardOverview.jsx`, `OpportunityExplorer.jsx`, `ClassroomProgress.jsx`, etc.) were authored, class selectors such as `.saas-app-layout`, `.saas-sidebar`, `.saas-main-wrapper`, `.saas-topbar`, `.saas-content-workspace`, `button.sidebar-nav-item`, `ul.nav-list`, `.kpi-bento-grid`, and widget rows were declared in JSX but omitted from `frontend/src/App.css`.
+- Because the structural layout rules (`display: flex;`, fixed sidebar positioning `position: fixed; width: var(--sidebar-width);`, `margin-left: var(--sidebar-width);`, button resets `appearance: none; background: transparent; border: none;`, and list resets `list-style: none; padding: 0;`) were missing, browser user-agent styles defaulted the elements to vertical document flow with browser button and list styling.
+
+### 2. Architectural Corrections Implemented
+- **SaaS Layout Architecture:**
+  - Added `.saas-app-layout` full-viewport flexbox container.
+  - Added `.saas-sidebar` fixed-position vertical gradient navigation with glassmorphism effects (`background: linear-gradient(180deg, var(--sidebar-start) 0%, var(--sidebar-end) 100%)`).
+  - Added explicit button and list resets: `ul.nav-list` with `list-style: none !important; margin: 0; padding: 0;`, `button.sidebar-nav-item` with `appearance: none; background: transparent; border: none; display: flex; align-items: center; gap: 12px; border-radius: var(--radius-md);`.
+  - Added `.sidebar-brand`, `.brand-logo-mark`, `.sidebar-counter-badge`, `.sidebar-badge-highlight`, `.sidebar-badge-opp`, and user session footer cards.
+  - Added `.saas-main-wrapper` with offset margin (`margin-left: var(--sidebar-width);`) and `.saas-content-workspace` centered container.
+- **Top Utility Bar:**
+  - Added `.saas-topbar` sticky header with global search box, quick actions, role badge, and user profile chip.
+- **Bento KPI Grid & Dashboard Canvas:**
+  - Added `.kpi-bento-grid` 4-column responsive grid with colored top accents (`.kpi-purple`, `.kpi-blue`, `.kpi-orange`, `.kpi-green`).
+  - Added workload breakdown progress bars (`.modern-progress-bar`, `.bar-seg`) and legend grid.
+  - Added dual widget layout for upcoming deadlines and items needing attention.
+  - Added quick action banner with purple gradient background.
+- **Responsive Adaptations:**
+  - Handled viewports across 1920x1080 (desktop), 1366x768 (laptop), 768px (tablet), and 390px (mobile).
+  - Tablet/mobile breakpoint (<= 768px): hides fixed sidebar off-screen (`transform: translateX(-100%);`), displays hamburger toggle in topbar, enables full-width main wrapper, and supports overlay backdrop.
+  - Small mobile breakpoint (<= 480px): collapses KPI grid to single column and stacks demo cards.
+
+### 3. Verification & Quality Gate
+- **Linting:** `npm --prefix frontend run lint` passed with 0 errors and 0 warnings.
+- **Frontend Build:** `npm --prefix frontend run build` built successfully without errors (`dist/assets/index-*.js`, `dist/assets/index-*.css`).
+- **Frontend Unit & E2E Tests:** `npm --prefix frontend test -- --run` passed all 84 test cases.
+- **Backend Tests:** `py -m pytest -q` passed all 293 tests.
+- **Git Whitespace:** `git diff --check` passed with 0 errors.
+
+
+---
+
+## SMART 2.1 — Final Dashboard Layout, Visual Polish & Demo Data Integrity Correction
+
+### 1. Teacher Demo Data Investigation & Root Cause Analysis
+During audit testing of the faculty portal, the Teacher Dashboard displayed zeros across all four KPI metrics (Assigned Courses, Active Coursework, Pending Grading, Graded Submissions).
+
+**Investigation Findings across the 7 Target Checks:**
+1. **SQLite Demo Data Existence:** The SQLite database `backend/data/smart.db` contained zero records in `classroom_courses`, `classroom_coursework`, and `classroom_submissions` because initial database creation only seeded `users` and left Classroom tables unpopulated until manual sync was invoked.
+2. **Course Assignment to Dr. Elena Vance:** In `backend/google_service.py`, `demo_cs401` was originally assigned to `"prof.rao@univ.edu"` and `demo_cs302` to `"dr.smith@univ.edu"`. Neither course was associated with the pre-provisioned demo teacher account `e.vance@university.edu`.
+3. **Teacher Role and Account Association:** In `classroom_courses`, `demo_cs401` and `demo_cs302` had `user_role = 'student'`, which caused the query in `get_teacher_coursework_overview` (`WHERE c.user_role = 'teacher'`) to filter them out.
+4. **Coursework References:** Coursework IDs properly referenced the courses (`demo_cw_cs401_lab2` -> `demo_cs401`, `demo_cw_cs302_parser` -> `demo_cs302`), but submissions referenced `"student.demo@univ.edu"` instead of the authenticated demo student `"alex.morgan@university.edu"`.
+5. **Teacher Analytics Query Logic:** In `backend/database.py`, `get_teacher_coursework_overview` strictly required `c.user_role = 'teacher'` AND `(c.teacher_email = ? OR c.teacher_email IS NULL)`. The query was corrected to match `(LOWER(c.teacher_email) = ? OR LOWER(c.owner_id) = ? OR c.user_role = 'teacher')`.
+6. **Frontend API Parameter Order & Credentials:** In `frontend/src/App.jsx`, `getTeacherCourseworkOverview(currentEmail, userRole)` inverted the parameters expected by `frontend/src/api.js` `(role, email)`. In addition, `credentials: "include"` was missing from several Classroom fetch calls in `frontend/src/api.js`, preventing the `smart_session` HttpOnly cookie from attaching.
+
+### 2. Implementation & Architectural Corrections
+- **Demo Data Integrity:**
+  - Updated `DEMO_COURSES` in `backend/google_service.py` to associate `CS401: Distributed Systems` and `CS302: Compiler Design` with `e.vance@university.edu` as instructor and course owner with `user_role = 'teacher'`.
+  - Added automatic demo data seeding to `init_db()` in `backend/database.py` so demo courses, coursework, submissions, study materials, and opportunities are consistently available upon startup.
+  - Linked submissions to `alex.morgan@university.edu` so that student submission views and teacher submission views match reality.
+- **Frontend API & Resilient Signatures:**
+  - Updated `getTeacherCourseworkOverview` in `frontend/src/api.js` to auto-detect whether arguments are passed as `(role, email)` or `(email, role)`. Added `credentials: "include"` across all classroom, study material, and opportunity endpoints.
+  - Corrected parameter order in `frontend/src/App.jsx`.
+- **Desktop Workspace Width & Responsiveness:**
+  - Expanded `.saas-content-workspace` from `max-width: 1400px` to `max-width: 1720px; width: 100%; padding: 28px 36px 48px;`.
+  - Content now fills 1920px widescreen monitors effectively without leaving an awkward blank space on the right, while remaining balanced on 1366px laptops.
+- **Topbar Rebuild & Button Standardizing:**
+  - Redesigned `.saas-topbar` with flexible left and right alignment, preventing page titles and descriptions from squeezing.
+  - Standardized all topbar buttons (`.topbar-btn`, `.topbar-btn-primary`, `.topbar-btn-google`, `.topbar-logout-btn`) to a consistent 38px height, uniform padding, typography, hover transitions, and clean SVG icons.
+  - Replaced browser-default buttons and emojis with Lucide-style inline SVGs.
+- **Visual Polish & Icon Replacement:**
+  - Replaced loose emojis (📘, 📄, 🏆, 🏫, 🛡️, 📚, 📝, ⏳, 👨‍🏫) across `TeacherDashboard.jsx`, `DashboardOverview.jsx`, `OpportunityExplorer.jsx`, `ClassroomProgress.jsx`, and `StudyMaterialsView.jsx` with crisp SVG iconography.
+  - Styled teacher course cards with 4-metric statistics grid (`tstat-box`) and student competition engagement summary counters.
+
+### 3. Quality Verification Gate
+- **Backend Tests:** `py -m pytest -q` passed **293/293 tests** in 49.37s.
+- **Frontend Tests:** `npm --prefix frontend test -- --run` passed **84/84 tests**.
+- **ESLint:** `npm --prefix frontend run lint` passed with **0 errors, 0 warnings**.
+- **Production Build:** `npm --prefix frontend run build` succeeded with clean output (`dist/assets/index-*.css`, `dist/assets/index-*.js`).
+- **Git Whitespace:** `git diff --check` passed cleanly with 0 whitespace errors.

@@ -1,237 +1,231 @@
-# SMART — Academic Intelligence Dashboard (Phase 2)
+# SMART 2.0 — Academic Communication Intelligence & Task Management System
 
-SMART is a privacy-preserving, local-first academic communication intelligence and task management application. It surfaces crucial educational notices, assignment deadlines, exam circulars, workshops, and opportunities buried inside high-volume group chat exports, and enables students to manage and export their deadlines without relying on cloud services.
+SMART 2.0 is a privacy-preserving, local-first academic communication intelligence platform. It analyzes high-volume student communication streams—WhatsApp group chats, Gmail academic notifications, Google Classroom announcements/coursework, and manual task notes—and extracts actionable academic notices, assignment deadlines, exam timetables, workshops, and opportunities.
+
+SMART operates with zero reliance on external or paid cloud AI APIs, using deterministic, explainable, and tamper-resistant extraction algorithms backed by HMAC cryptographic provenance.
 
 ---
 
-## 1. Objective & Architecture
-
-Phase 2 transforms SMART from a temporary chat analysis demo into a persistent academic task management system:
-
-`Upload chat → Extract candidate items → Review source evidence → Save selected items → Manage tasks → Export confirmed deadlines`
-
-### System Architecture
+## 1. System Architecture & Capabilities
 
 ```mermaid
 flowchart TD
-    subgraph UI["React + Vite Frontend (localhost:5173)"]
-        Tab1["💬 Analyze Chat Area"]
-        Tab2["📋 My Academic Tasks Area"]
+    subgraph Sources["Communication Sources"]
+        WA["WhatsApp Exports (.txt)"]
+        GM["Gmail Messages (JSON/RFC)"]
+        GC["Google Classroom (JSON)"]
+        MN["Manual Notes (Text)"]
     end
 
-    subgraph Backend["FastAPI Backend (localhost:8000)"]
-        Parser["Parser (Android / iOS text formats)"]
-        Extractor["Rule-Based Extractor (Word-boundary regex)"]
-        API["FastAPI Endpoints"]
-        CalExport["RFC 5545 iCalendar Engine"]
+    subgraph Adapters["Source Adapter Layer"]
+        A_WA["WhatsAppAdapter"]
+        A_GM["GmailAdapter"]
+        A_GC["GoogleClassroomAdapter"]
+        A_MN["ManualAdapter"]
     end
 
-    subgraph Storage["Persistence Layer"]
-        DB[(SQLite3: backend/data/smart.db)]
+    subgraph Intelligence["SMART 2.0 Intelligence Core"]
+        Classifier["Deterministic Classifier & Chatter Rejection"]
+        Temporal["Temporal Parser (Source Timestamp Anchored)"]
+        Prioritizer["Academic Prioritization Matrix (Urgency/Importance)"]
+        HMAC["Provenance Engine (HMAC-SHA256 Token Signing)"]
     end
 
-    Tab1 -->|"POST /api/extract-academic"| API
-    API --> Parser --> Extractor --> API
-    API -->|"Candidate detections + audit reasons"| Tab1
-    Tab1 -->|"POST /api/academic-items (Save Item)"| API
-    API --> DB
+    subgraph Persistence["Transactional Persistence (SQLite3 WAL)"]
+        DB[(smart.db)]
+        Dedup["Clause-Aware Deduplication"]
+        Atomic["Atomic Task Association Engine"]
+    end
 
-    Tab2 -->|"GET /api/academic-items (Search & Filters)"| API
-    DB --> API --> Tab2
-    Tab2 -->|"PATCH /api/academic-items/{id} (Status)"| API
-    Tab2 -->|"DELETE /api/academic-items/{id} (Delete)"| API
-    Tab2 -->|"GET /api/academic-items/export-ics"| CalExport
-    CalExport -->|".ics Calendar File"| Tab2
+    subgraph UI["Intelligent Frontend Workspace (React + Vite)"]
+        Analyze["Multi-Source Ingestion Tabs"]
+        Matrix["Actionability & Prioritization Views"]
+        Timeline["Academic Deadline Timeline"]
+        Saved["Task Lifecycle Management"]
+        Export["RFC 5545 iCalendar (.ics) Export"]
+    end
+
+    WA --> A_WA
+    GM --> A_GM
+    GC --> A_GC
+    MN --> A_MN
+
+    A_WA & A_GM & A_GC & A_MN --> Classifier
+    Classifier --> Temporal --> Prioritizer --> HMAC
+    HMAC -->|"Signed Candidates + Metadata"| Analyze
+    Analyze -->|"Save with Candidate Token"| Dedup
+    Dedup --> Atomic --> DB
+    DB --> Saved & Matrix & Timeline
+    Saved --> Export
 ```
 
-### Component Structure
-- `backend/database.py`: SQLite connection management, schema initialization, parameterized queries, deduplication, and task CRUD operations.
-- `backend/calendar_export.py`: RFC 5545 iCalendar serialization, character escaping (`\`, `;`, `,`, `\n`), and 75-octet line folding.
-- `backend/parser.py`: Robust multiline WhatsApp chat export parser supporting 12h/24h timestamps and Unicode formatting marks.
-- `backend/extractor.py`: Rule-based extraction, conservative date resolution, and review flags.
-- `backend/main.py`: FastAPI application routing, request validation, CORS middleware, and lifespan schema setup.
-- `backend/tests/`: Automated pytest suite (41 tests) covering parser, extractor, database CRUD, deduplication, filters, and export.
-- `frontend/src/api.js`: Shared API client and base URL configuration.
-- `frontend/src/App.jsx`: Responsive UI featuring dual tabs ("Analyze Chat" and "My Academic Tasks"), candidate saving, status controls, filter panels, and accessible modals.
-- `frontend/src/App.css`: Modern visual styling with accessible focus rings, status badges, and responsive layouts.
+### Core Capabilities
+1. **Multi-Source Ingestion**: Pluggable source adapters decouple communication platforms (WhatsApp, Gmail, Google Classroom, Manual) into a normalized `SourceMessage` representation.
+2. **Deterministic Information Extraction**: Rigorous word-boundary regex patterns classify tasks into `Assignment`, `Exam`, `Announcement`, `Event`, and `Opportunity`, rejecting negative directives and conversational student chatter.
+3. **Temporal Intelligence**:
+   - Anchors relative dates (`tomorrow`, `this Friday`, `next Monday`, `in 2 weeks`) strictly to the original source message timestamp rather than the current system clock.
+   - Accurately differentiates `by Monday` (due on Monday) from `before Monday` (due Sunday).
+   - Extracts explicit 12-hour and 24-hour clock times and normalizes date ranges (`2026-11-25 to 2026-11-28`).
+   - Flags ambiguous dates or historical events for human review.
+4. **Intelligent Prioritization Matrix**:
+   - Calculates dynamic urgency scores based on remaining days (`Overdue`, `Urgent <= 2d`, `Approaching <= 7d`, `Scheduled > 7d`).
+   - Assigns multi-factor importance (`CRITICAL`, `HIGH`, `NORMAL`, `LOW`) from academic keywords and deliverables.
+   - Evaluates actionability (`action_required` vs `informational`).
+5. **Cryptographic Provenance & Tamper Resistance**:
+   - Extraction candidates are cryptographically bound to exact character evidence offsets, confidence metrics, and source platform metadata via HMAC SHA-256 tokens.
+   - Clients cannot forge confidence scores, external platform origins (`gmail`, `google_classroom`), or modify source metadata without invalidating the token.
+6. **Transactional Task Association**:
+   - Deadline modifications (extensions, postponements, cancellations, revisions) atomically transition predecessor tasks (`superseded`, `cancelled`) in a single SQLite immediate transaction.
+   - Multi-task deduplication safely allows distinct tasks from the same announcement to coexist while rejecting duplicate saves.
+7. **RFC 5545 iCalendar Export**: Generates compliant `.ics` calendars with DTSTART/DTEND, explicit times, all-day event fallbacks, 75-octet line folding, and character escaping.
 
 ---
 
-## 2. SQLite Database & Persistence
+## 2. Directory Structure
 
-- **Database Engine:** Python's standard library `sqlite3` with Write-Ahead Logging (`PRAGMA journal_mode = WAL;`) and foreign keys enabled.
-- **Default Location:** `backend/data/smart.db` (the directory is created automatically on application startup).
-- **Environment Override:** Set the `SMART_DB_PATH` environment variable to use an alternate database file (used automatically during automated tests for isolation).
-- **Git Safety:** The database and journal files are ignored via `.gitignore` (`backend/data/*.db`, `*.sqlite`, `*.db`). The `backend/data/.gitkeep` file ensures the directory structure exists in version control.
-
-### Table Schema: `academic_items`
-
-| Column | Type | Description |
-| :--- | :--- | :--- |
-| `id` | `INTEGER PRIMARY KEY AUTOINCREMENT` | Unique identifier for each saved task. |
-| `title` | `TEXT NOT NULL` | Title of the academic notice or deadline. |
-| `category` | `TEXT NOT NULL` | `Assignment`, `Exam`, `Announcement`, `Event`, or `Opportunity`. |
-| `description` | `TEXT` | Detailed description or context. |
-| `date_text` | `TEXT` | Raw date expression from the chat. |
-| `due_date` | `TEXT` | Nullable ISO date string (`YYYY-MM-DD`). |
-| `date_type` | `TEXT` | `deadline`, `mentioned_date`, `event_date`, or `unknown`. |
-| `date_status` | `TEXT` | Confidence status (e.g. `confirmed_explicit`, `needs_review`). |
-| `status` | `TEXT NOT NULL` | Task lifecycle: `pending`, `completed`, or `dismissed`. |
-| `source_sender` | `TEXT` | Name or number of the message sender. |
-| `source_timestamp`| `TEXT` | Original timestamp string from the chat export. |
-| `source_text` | `TEXT NOT NULL` | Full, unaltered original WhatsApp message text. |
-| `source_filename` | `TEXT` | Name of the source `.txt` file. |
-| `review_required` | `INTEGER NOT NULL` | `0` or `1` boolean flag. |
-| `review_reasons` | `TEXT` | JSON-serialized array of audit strings. |
-| `created_at` | `TEXT NOT NULL` | UTC ISO 8601 timestamp. |
-| `updated_at` | `TEXT NOT NULL` | UTC ISO 8601 timestamp. |
-
-### Indexes
-- `idx_academic_items_category` on `category`
-- `idx_academic_items_status` on `status`
-- `idx_academic_items_due_date` on `due_date`
-- `idx_academic_items_dedup` on `(source_text, source_timestamp, source_sender, category)`
-
-### Deduplication Strategy
-To prevent accidental duplicate saves when users re-analyze chats or click save multiple times, SMART verifies source provenance against existing records:
-`source_text`, `source_timestamp`, `source_sender`, `category`, and `source_filename`.
-If an identical item already exists, `POST /api/academic-items` returns `409 Conflict` with the existing task ID, and the frontend updates the card to show **"✓ Already Saved"**. Two genuine distinct messages with the same title are never blocked.
+```
+SMART/
+├── .env.example                       # Production & development configuration template
+├── README.md                          # Comprehensive documentation
+├── SMART_DEVELOPMENT_LOG.md           # Engineering development log & milestone history
+├── backend/
+│   ├── calendar_export.py             # RFC 5545 iCalendar generator
+│   ├── database.py                    # SQLite schema, transactions, migrations & queries
+│   ├── extractor.py                   # Academic categorization, segmentation, HMAC signing
+│   ├── main.py                        # FastAPI application endpoints & lifecycle
+│   ├── parser.py                      # WhatsApp chat parser (Android/iOS multiline)
+│   ├── requirements.txt               # Backend Python dependencies
+│   ├── source_adapters.py             # SourceMessage contracts and platform adapters
+│   ├── temporal_parser.py             # Anchor-based relative date and time parsing
+│   ├── data/                          # SQLite persistent storage (smart.db)
+│   └── tests/                         # Pytest test suite (280+ tests)
+└── frontend/
+    ├── index.html                     # Frontend HTML entry point
+    ├── package.json                   # Vite, React, Vitest dependencies & scripts
+    ├── vite.config.js                 # Vite bundler configuration
+    └── src/
+        ├── App.jsx                    # React academic dashboard application
+        ├── App.css                    # Visual design, color tokens & responsiveness
+        ├── api.js                     # Centralized API client
+        └── utils/                     # Confidence filtering & prioritization logic
+```
 
 ---
 
-## 3. API Reference
+## 3. Technology Stack
 
-### Health & Analysis
-- `GET /api/health`: Health status and project metadata.
-- `POST /api/upload-chat`: Parses uploaded `.txt` file into structured messages.
-- `POST /api/extract-academic`: Extracts candidate academic items, flags uncertain dates, and categorizes messages.
-
-### Persistence & Task Management (Phase 2)
-- `POST /api/academic-items`:
-  - Validates and saves a candidate item.
-  - Returns `201 Created` with the persisted record.
-  - Returns `409 Conflict` if the item is already saved.
-  - Returns `400 Bad Request` if category, status, or date formats are invalid.
-- `GET /api/academic-items`:
-  - Retrieves saved academic items with deterministic sorting: upcoming dated items first chronologically, followed by undated items, with newest first.
-  - Query parameters:
-    - `category`: Filter by `Assignment`, `Exam`, `Announcement`, `Event`, `Opportunity`.
-    - `status`: Filter by `pending`, `completed`, `dismissed`.
-    - `search`: Keyword search across `title`, `description`, and `source_text`.
-    - `due_before`: ISO date (`YYYY-MM-DD`).
-    - `due_after`: ISO date (`YYYY-MM-DD`).
-- `GET /api/academic-items/{item_id}`:
-  - Retrieves a single saved academic item. Returns `404` if not found.
-- `PATCH /api/academic-items/{item_id}`:
-  - Updates the task status (`{"status": "completed"}`). Updates `updated_at`. Returns `404` if not found, `400` if status is invalid.
-- `DELETE /api/academic-items/{item_id}`:
-  - Permanently deletes the task. Returns `404` if not found.
-- `GET /api/academic-items/export-ics` (alias: `export.ics`):
-  - Generates and downloads an RFC 5545 compliant `.ics` calendar containing only saved items with a valid `due_date` and `date_type="deadline"`.
-  - Excludes mentioned dates, event dates, and undated items.
-  - Returns `404` with a descriptive message if no confirmed deadlines exist.
+- **Backend**:
+  - Python 3.10+ (tested on Python 3.14)
+  - FastAPI 0.115+
+  - Starlette & Uvicorn
+  - Pydantic v2
+  - Python Standard Library: `sqlite3`, `hmac`, `hashlib`, `re`, `datetime`
+- **Frontend**:
+  - React 19
+  - Vite 8
+  - Native ES Modules & Fetch API
+  - Modern CSS (Flexbox, Grid, CSS Variables)
+- **Quality & Verification**:
+  - Pytest (Backend automated tests)
+  - Vitest (Frontend unit and E2E integration tests)
+  - ESLint (Frontend static analysis)
 
 ---
 
 ## 4. Setup & Running the Application
 
 ### Prerequisites
-- **Python**: 3.10+ (tested on Python 3.14)
-- **Node.js**: 18+ (tested on Node.js with Vite 8)
+- **Python 3.10+**
+- **Node.js 18+** with `npm`
 
-### Running the Backend
+### Step 1: Environment Configuration
+Copy `.env.example` to `.env` (optional for local development, as safe defaults are built in):
+```bash
+cp .env.example .env
+```
+
+Key environment variables:
+| Variable | Default | Purpose |
+| :--- | :--- | :--- |
+| `HOST` | `127.0.0.1` | Backend bind host address. |
+| `PORT` | `8000` | Backend bind port. |
+| `SMART_DB_PATH` | `backend/data/smart.db` | SQLite database file location. |
+| `SMART_PROVENANCE_SECRET` | *(Random ephemeral key)* | 32-byte hex key for HMAC candidate tokens. |
+| `VITE_API_URL` | `http://127.0.0.1:8000` | Backend API base URL for frontend requests. |
+
+### Step 2: Backend Setup & Execution
 From the project root:
 ```bash
-# 1. Install backend dependencies
+# 1. Install dependencies
 py -m pip install -r backend/requirements.txt
 
-# 2. Run the FastAPI development server
+# 2. Start FastAPI development server
 py -m uvicorn backend.main:app --reload --host 127.0.0.1 --port 8000
 ```
-Backend will be available at `http://127.0.0.1:8000`. Test health at `http://127.0.0.1:8000/api/health`.
+- API Base: `http://127.0.0.1:8000`
+- Interactive API Docs: `http://127.0.0.1:8000/docs`
+- Health Endpoint: `http://127.0.0.1:8000/api/health`
 
-### Running the Frontend
-In a separate terminal:
+### Step 3: Frontend Setup & Execution
+In a separate terminal from the project root:
 ```bash
-# 1. Navigate to frontend directory
+# 1. Navigate to frontend
 cd frontend
 
-# 2. Install dependencies (if not already installed)
+# 2. Install dependencies
 npm install
 
 # 3. Start Vite dev server
 npm run dev
 ```
-Frontend will be available at `http://localhost:5173`. Open this URL in your web browser.
+- Frontend UI: `http://localhost:5173`
 
 ---
 
-## 5. Running Automated Tests
+## 5. Automated Verification Suite
 
-### Backend Test Suite (pytest)
-From `backend/`:
+Run all quality gates with a single set of commands:
+
 ```bash
-py -m pytest -v
-```
-All **41 automated tests** run against an isolated temporary SQLite database (configured via `conftest.py`), leaving your development database untouched:
-1. `test_database_initialization`: Verifies table creation and index setup.
-2. `test_save_academic_item_api`: Validates persistence via `POST /api/academic-items`.
-3. `test_list_saved_items_deterministic_ordering`: Verifies chronological ordering for dated items and subsequent undated items.
-4. `test_search_and_category_filters`: Verifies search and category query parameters.
-5. `test_status_filters`: Verifies pending, completed, and dismissed filters.
-6. `test_date_range_filters`: Verifies `due_before` and `due_after` filtering.
-7. `test_update_task_status_lifecycle`: Verifies transitions between pending, completed, and dismissed, and timestamp updates.
-8. `test_invalid_status_and_dates_rejected`: Verifies 400 Bad Request on invalid inputs.
-9. `test_nonexistent_item_ids_return_404`: Verifies 404 responses for missing items.
-10. `test_delete_saved_item`: Verifies deletion and subsequent 404 responses.
-11. `test_duplicate_save_rejected_with_conflict`: Verifies deduplication and 409 Conflict.
-12. `test_export_confirmed_deadlines_ics`: Verifies RFC 5545 format, headers, UIDs, and VEVENT generation.
-13. `test_export_excludes_non_deadlines`: Verifies non-deadlines and undated items are excluded from `.ics`.
-14. `test_icalendar_text_escaping`: Verifies RFC 5545 escaping of backslashes, semicolons, commas, and newlines, and 75-octet line folding.
-15. Existing parser, extractor, upload, and health check regression tests (27 tests).
+# Backend pytest suite (280+ tests)
+py -m pytest -q
 
-### Frontend Verification (ESLint & Vite Build)
-From `frontend/`:
-```bash
-npm run lint
-npm run build
+# Frontend Vitest suite (80+ tests)
+npm --prefix frontend test -- --run
+
+# Frontend code linting (0 errors, 0 warnings)
+npm --prefix frontend run lint
+
+# Frontend production asset build
+npm --prefix frontend run build
+
+# Git diff check (no whitespace or format regressions)
+git diff --check
 ```
-Builds production assets cleanly with 0 warnings or errors.
 
 ---
 
-## 6. End-to-End Workflow Walkthrough
+## 6. API Reference
 
-Use the synthetic test fixture at `backend/tests/fixtures/sample_chat.txt` to test the complete workflow:
+### Source Ingestion & Extraction
+- `POST /api/extract-academic-source`: Universal extraction endpoint accepting `source_type` (`whatsapp`, `gmail`, `google_classroom`, `manual`) and raw payload or text.
+- `POST /api/upload-chat`: Parses uploaded WhatsApp `.txt` file into structured chat messages.
+- `POST /api/extract-academic`: Direct extraction from parsed WhatsApp messages.
 
-1. **Upload & Extract:**
-   - Go to `http://localhost:5173`.
-   - On the **"Analyze Chat"** tab, drag and drop `backend/tests/fixtures/sample_chat.txt`.
-   - Click **"Analyze conversation →"**.
-2. **Review Evidence:**
-   - View extracted candidate cards (e.g., Assignment 3 submission, Machine Learning Internal Test).
-   - Expand **"Inspect Original Source Evidence"** to review the exact sender, timestamp, and message.
-3. **Save to Task Management:**
-   - Click **"+ Save to Tasks"** on the Assignment 3 card.
-   - The button transitions through a loading spinner and updates to **"✓ Already Saved"**.
-4. **Manage Tasks:**
-   - Click the **"📋 My Academic Tasks"** tab in the navigation bar.
-   - Observe the saved task displayed with its category color pill, status badge (**PENDING**), and due date.
-   - Click **"✓ Completed"** to update its status. The card updates dynamically and the completed counter increases.
-   - Test search and category filters.
-5. **Export Confirmed Deadlines:**
-   - Click **"Export Confirmed Deadlines (.ics)"**.
-   - Your browser downloads `smart_academic_deadlines.ics`.
-   - Open the `.ics` file in Microsoft Outlook, Apple Calendar, or Google Calendar to confirm the deadline event appears on the correct date without invented times.
-6. **Safe Deletion:**
-   - Click **"🗑 Delete"** on a saved task.
-   - Confirm via the accessible modal dialog. The item is removed from the database without altering the original chat file.
+### Persistence & Task Management
+- `GET /api/academic-items`: Retrieves saved items with support for search, category, status, importance, urgency, and source_type filtering.
+- `POST /api/academic-items`: Validates and saves candidate tasks with HMAC token verification, deduplication, and atomic predecessor transitions.
+- `GET /api/academic-items/{id}`: Retrieves a single academic task by ID.
+- `PATCH /api/academic-items/{id}`: Updates status (`pending`, `completed`, `dismissed`, `superseded`, `cancelled`).
+- `DELETE /api/academic-items/{id}`: Deletes a saved academic task.
+- `GET /api/academic-items/export-ics`: Exports confirmed academic deadlines as an RFC 5545 `.ics` calendar file.
 
 ---
 
-## 7. Privacy & Security Principles
+## 7. Production & Security Considerations
 
-1. **100% Local Execution:** Chat parsing, information extraction, and database persistence run entirely on your local machine. No student chat logs or tasks are sent to external servers or cloud AI providers.
-2. **No Executable Content:** Uploaded chat files are parsed as plain text and discarded after extraction. File contents are never stored as executable binaries.
-3. **Single-User Prototype Scope:** This version is intentionally designed as an offline single-user prototype without authentication overhead.
-4. **Evidence Preservation:** Every saved academic item preserves the exact sender, timestamp, and message text so students can verify instructions directly with official sources.
+1. **Local-First Privacy**: All parsing, natural language extraction, and task management run entirely on the host machine. No academic data, student correspondence, or message snippets leave the system.
+2. **Cryptographic Secret Rotation**: In production, configure a static `SMART_PROVENANCE_SECRET` in `.env` to ensure HMAC candidate tokens remain valid across server restarts and across multi-worker deployments.
+3. **Write-Ahead Logging (WAL)**: SQLite operates in WAL mode (`PRAGMA journal_mode = WAL;`) for concurrent read/write operations without table locking.
+4. **Input Sanitization**: All database queries use parameterized SQL statements to eliminate SQL injection vulnerabilities.
+5. **CORS Restrictions**: For production deployments, adjust CORS allowed origins in `backend/main.py` to match the production domain.

@@ -89,7 +89,14 @@ def generate_ics(items: list[dict[str, Any]]) -> str:
         # Strict filter: only confirmed deadlines with valid due_date
         due_date = item.get("due_date")
         date_type = (item.get("date_type") or "").strip().lower()
+        item_status = (item.get("status") or "").strip().lower()
+        update_type = (item.get("update_type") or "").strip().lower()
+
         if not due_date or date_type != "deadline":
+            continue
+        if item_status in ("dismissed", "cancelled", "superseded"):
+            continue
+        if update_type == "cancellation":
             continue
 
         # Format date as YYYYMMDD

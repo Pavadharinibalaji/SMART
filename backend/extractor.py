@@ -19,6 +19,13 @@ from datetime import date, datetime, timedelta
 from typing import Any
 from urllib.parse import urlparse
 
+from prioritization import (
+    assess_academic_importance,
+    assess_task_urgency,
+    calculate_priority,
+    classify_academic_intent,
+)
+
 # Provenance signing secret (configurable via env; random secure key generated on startup if omitted)
 _RUNTIME_PROVENANCE_SECRET: bytes | None = None
 
@@ -45,7 +52,8 @@ def create_candidate_token(candidate: dict[str, Any]) -> str:
     """Create a tamper-evident HMAC-SHA256 token certifying candidate extraction provenance.
 
     Binds the authoritative source_text, category, evidence_text, evidence_start_index,
-    evidence_end_index, confidence, and confidence_reasons.
+    evidence_end_index, confidence, confidence_reasons, is_actionable, actionability_type,
+    update_type, due_date, date_status, date_text, date_type, and is_range.
     """
     provenance_data = {
         "source_text": candidate.get("source_text", ""),
@@ -55,6 +63,22 @@ def create_candidate_token(candidate: dict[str, Any]) -> str:
         "evidence_end_index": candidate.get("evidence_end_index"),
         "confidence": candidate.get("confidence", "UNASSESSED"),
         "confidence_reasons": candidate.get("confidence_reasons") or [],
+        "is_actionable": bool(candidate.get("is_actionable", True)),
+        "actionability_type": str(candidate.get("actionability_type", "action_required")),
+        "update_type": candidate.get("update_type"),
+        "due_date": candidate.get("due_date"),
+        "date_status": candidate.get("date_status"),
+        "date_text": candidate.get("date_text"),
+        "date_type": candidate.get("date_type"),
+        "is_range": bool(candidate.get("is_range", False)),
+        "previous_due_date": candidate.get("previous_due_date"),
+        "time_text": candidate.get("time_text"),
+        "deadline_time": candidate.get("deadline_time"),
+        "importance": candidate.get("importance", "UNASSESSED"),
+        "academic_intent": candidate.get("academic_intent"),
+        "source_type": candidate.get("source_type", "whatsapp"),
+        "source_id": candidate.get("source_id"),
+        "source_metadata": candidate.get("source_metadata") or {},
     }
     raw_json = json.dumps(provenance_data, sort_keys=True, separators=(",", ":")).encode("utf-8")
     payload_b64 = base64.urlsafe_b64encode(raw_json).decode("ascii")
@@ -96,11 +120,12 @@ CATEGORY_PATTERNS: dict[str, list[re.Pattern[str]]] = {
     "Assignment": [
         re.compile(r"\bassignments?\b", re.I),
         re.compile(r"\bhomeworks?\b", re.I),
+        re.compile(r"\bproblem\s+sets?\b", re.I),
         re.compile(r"\bsubmissions?\b", re.I),
         re.compile(r"\bsubmit(?:s|ted|ting)?\b", re.I),
         re.compile(r"\bcoursework\b", re.I),
         re.compile(r"\blab\s+(?:record|manual|submission|report|exercise)s?\b", re.I),
-        re.compile(r"\bproject\s+(?:submission|report|deadline|demo|presentation|evaluation)s?\b", re.I),
+        re.compile(r"\bproject\s+(?:submission|report|deadline|demo|presentation|evaluation|proposal|phase\s*\d+)s?\b", re.I),
     ],
     "Exam": [
         re.compile(r"\bexams?\b", re.I),
@@ -123,7 +148,8 @@ CATEGORY_PATTERNS: dict[str, list[re.Pattern[str]]] = {
         re.compile(r"\bschedule\s+change\b", re.I),
         re.compile(r"\bpostponed\b", re.I),
         re.compile(r"\brescheduled\b", re.I),
-        re.compile(r"\bclasses?\s+(?:cancelled|suspended)\b", re.I),
+        re.compile(r"\bclasses?\s+(?:are\s+)?(?:cancelled|suspended)\b", re.I),
+        re.compile(r"\b(?:cancelled|canceled|cancellation|called\s+off)\b", re.I),
         re.compile(r"\bholiday\s+declared\b", re.I),
     ],
     "Opportunity": [
@@ -154,7 +180,8 @@ TRAILING_PUNCTUATION = ".,!?;:)]}>\"'"
 DEADLINE_INDICATORS = [
     re.compile(r"\bdue\b", re.I),
     re.compile(r"\bdeadlines?\b", re.I),
-    re.compile(r"\bsubmit(?:s|ted|ting)?\b.*?\b(?:by|before|on)\b", re.I),
+    re.compile(r"\bsubmit(?:s|ted|ting)?\b.*?\b(?:by|before|on|today|tomorrow|tonight)\b", re.I),
+    re.compile(r"\bsubmit(?:s|ted|ting)?\b", re.I),
     re.compile(r"\bsubmissions?\s+(?:is|by|deadline|date|before|due)\b", re.I),
     re.compile(r"\blast\s+date\b", re.I),
     re.compile(r"\blast\s+day\b", re.I),
@@ -166,93 +193,36 @@ DEADLINE_INDICATORS = [
     re.compile(r"\bregistration\s+(?:deadline|closes?|date)\b", re.I),
 ]
 
-RELATIVE_DAYS = {
-    "day after tomorrow": 2,
-    "tomorrow": 1,
-    "today": 0,
-    "tonight": 0,
-}
-
-WEEKDAY_MAP: dict[str, int] = {
-    "monday": 0, "mon": 0,
-    "tuesday": 1, "tue": 1,
-    "wednesday": 2, "wed": 2,
-    "thursday": 3, "thu": 3,
-    "friday": 4, "fri": 4,
-    "saturday": 5, "sat": 5,
-    "sunday": 6, "sun": 6,
-}
-
-PATTERN_RELATIVE_WEEKDAY = re.compile(
-    r"\b(?:(?P<modifier>this|coming|next)\s+)?(?P<weekday>Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday|Mon|Tue|Wed|Thu|Fri|Sat|Sun)\b",
-    re.IGNORECASE,
+from temporal_parser import (
+    BASIC_RELATIVE_DAYS,
+    MONTH_NAMES,
+    PATTERN_BASIC_RELATIVE,
+    PATTERN_DATE_RANGE,
+    PATTERN_DAY_MONTH_NO_YEAR,
+    PATTERN_DAY_MONTH_YEAR,
+    PATTERN_MONTH_DAY_NO_YEAR,
+    PATTERN_MONTH_DAY_YEAR,
+    PATTERN_MONTH_END,
+    PATTERN_NUMERIC_FULL,
+    PATTERN_RELATIVE_DURATION,
+    PATTERN_RELATIVE_WEEKDAY,
+    TIME_12H_NO_MINUTES,
+    TIME_12H_WITH_MINUTES,
+    TIME_24H,
+    WEEKDAY_MAP,
+    clean_ordinal,
+    clean_ordinal as _clean_ordinal,
+    detect_all_dates,
+    detect_date,
+    extract_time,
+    extract_update_transition_dates,
+    parse_message_date,
+    parse_number,
+    parse_reference_timestamp,
+    resolve_weekday,
 )
 
-TIME_12H_WITH_MINUTES = re.compile(
-    r"\b(?P<hour>1[0-2]|0?[1-9]):(?P<minute>[0-5]\d)\s*(?P<ampm>[AaPp]\.?[Mm]\.?)\b"
-)
-TIME_12H_NO_MINUTES = re.compile(
-    r"\b(?P<hour>1[0-2]|0?[1-9])\s*(?P<ampm>[AaPp]\.?[Mm]\.?)\b"
-)
-TIME_24H = re.compile(
-    r"\b(?P<hour>[01]?\d|2[0-3]):(?P<minute>[0-5]\d)\b(?!\s*[:/.-]\d)"
-)
-
-MONTH_NAMES = (
-    r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|"
-    r"May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|"
-    r"Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
-)
-
-# Explicit date regexes
-# 1. Day Month Year (e.g. 24th October 2026, 24 Oct 2026, 20 November 2026)
-PATTERN_DAY_MONTH_YEAR = re.compile(
-    rf"\b(?P<day>\d{{1,2}})(?:st|nd|rd|th)?\s+(?:of\s+)?(?P<month>{MONTH_NAMES})(?:,?\s+(?P<year>\d{{4}}))\b",
-    re.IGNORECASE,
-)
-
-# 2. Month Day Year (e.g. October 24th, 2026 or December 5, 2026)
-PATTERN_MONTH_DAY_YEAR = re.compile(
-    rf"\b(?P<month>{MONTH_NAMES})\s+(?P<day>\d{{1,2}})(?:st|nd|rd|th)?(?:,?\s+(?P<year>\d{{4}}))\b",
-    re.IGNORECASE,
-)
-
-# 3. Day Month WITHOUT Year (e.g. 24th October, October 24) -> Must NOT invent year
-PATTERN_DAY_MONTH_NO_YEAR = re.compile(
-    rf"\b(?P<day>\d{{1,2}})(?:st|nd|rd|th)?\s+(?:of\s+)?(?P<month>{MONTH_NAMES})\b(?!,?\s+\d{{4}})",
-    re.IGNORECASE,
-)
-PATTERN_MONTH_DAY_NO_YEAR = re.compile(
-    rf"\b(?P<month>{MONTH_NAMES})\s+(?P<day>\d{{1,2}})(?:st|nd|rd|th)?\b(?!,?\s+\d{{4}})",
-    re.IGNORECASE,
-)
-
-# 4. Numeric dates (DD/MM/YYYY or DD-MM-YYYY or YYYY-MM-DD or DD.MM.YYYY)
-PATTERN_NUMERIC_FULL = re.compile(
-    r"\b(?P<p1>\d{1,4})[./-](?P<p2>\d{1,2})[./-](?P<p3>\d{2,4})\b"
-)
-
-
-def parse_message_date(timestamp_text: str) -> date | None:
-    """Parse WhatsApp message timestamp date conservatively."""
-    if not timestamp_text:
-        return None
-
-    date_part = timestamp_text.split(",", 1)[0].strip()
-
-    # Try common WhatsApp export date formats
-    for fmt in (
-        "%d/%m/%Y", "%d/%m/%y",
-        "%d-%m-%Y", "%d-%m-%y",
-        "%d.%m.%Y", "%d.%m.%y",
-        "%Y-%m-%d",
-    ):
-        try:
-            return datetime.strptime(date_part, fmt).date()
-        except ValueError:
-            continue
-
-    return None
+RELATIVE_DAYS = BASIC_RELATIVE_DAYS
 
 
 def extract_urls(text: str) -> list[str]:
@@ -278,394 +248,140 @@ def extract_urls(text: str) -> list[str]:
     return list(dict.fromkeys(urls))
 
 
-def _clean_ordinal(text: str) -> str:
-    """Strip st/nd/rd/th suffix from numeric day."""
-    return re.sub(r"(\d+)(?:st|nd|rd|th)\b", r"\1", text, flags=re.IGNORECASE)
 
 
-def resolve_weekday(text: str, message_date: date | None) -> dict[str, Any] | None:
-    """Resolve a relative weekday expression using message timestamp date as anchor."""
+
+# Conversational student chatter patterns to prevent false positives from casual chat
+PAST_TENSE_COMPLETION_PATTERNS = [
+    re.compile(r"\b(?:i|we|already)\s+(?:have\s+)?(?:completed|submitted|finished|done|uploaded)\b", re.I),
+    re.compile(r"\b(?:i've|we've)\s+(?:completed|submitted|finished|done|uploaded)\b", re.I),
+    re.compile(r"\b(?:completed|submitted|finished|uploaded)\s+(?:the|my|our)\s+(?:assignment|homework|lab|report|record|project)\b", re.I),
+    re.compile(r"\bdone\s+with\s+(?:the\s+)?(?:assignment|homework|lab|project)\b", re.I),
+]
+
+PEER_QUESTION_PATTERNS = [
+    re.compile(r"^(?:is|did|has|have|can|could|will|would|are|does|do|anyone|anybody)\b.*\?", re.I),
+    re.compile(r"^(?:what|when|where|why|how)\b.*(?:\?|$)", re.I),
+    re.compile(r"\b(?:did\s+anyone|has\s+anyone|anyone\s+submitted|is\s+tomorrow|when\s+is\s+the|what\s+is\s+the)\b.*(?:\?|$)", re.I),
+    re.compile(r"\?+\s*$", re.I),
+]
+
+DISCUSSION_WITHOUT_DELIVERABLE_PATTERNS = [
+    re.compile(r"\b(?:assignment|exam|quiz|project|lab|homework)\s+(?:discussion|meeting|clarification|doubt\s+clearing|review\s+session)\b", re.I),
+    re.compile(r"\b(?:discussion|meeting|clarification|doubt\s+clearing)(?:\s+session)?\s+(?:on|about|for|regarding)\s+(?:the\s+)?(?:assignment|exam|quiz|project|lab|homework)\b", re.I),
+]
+
+# Explicit negative directives instructing not to perform an action (e.g. "Do not submit the old assignment.")
+NEGATIVE_DIRECTIVE_PATTERNS = [
+    re.compile(r"\b(?:do\s+not|don't|no\s+need\s+to|should\s+not|never)\s+(?:submit|register|attend|upload|apply|come)\b", re.I),
+]
+
+# Historical and completed past event patterns
+HISTORICAL_PAST_PATTERNS = [
+    re.compile(r"\b(?:was|were)\s+(?:conducted|held|organized|completed|done|finished|taken|concluded)\b", re.I),
+    re.compile(r"\b(?:happened|occurred|took\s+place|concluded)\b", re.I),
+    re.compile(r"\b(?:deadline\s+was|was\s+the\s+deadline)\b", re.I),
+]
+
+IMPERATIVE_DIRECTIVE_PATTERN = re.compile(
+    r"\b(?:must\s+submit|please\s+submit|kindly\s+submit|submit\s+(?:by|before|on)|due\s+(?:on|by|date)|all\s+students\s+must|deadline\s+is)\b",
+    re.I,
+)
+
+
+def is_conversational_chatter(text: str) -> bool:
+    """Check if a message or segment is conversational student chatter rather than an academic instruction."""
+    if not text:
+        return False
+    clean = text.strip()
+    # Explicit negative directives (e.g. "Do not submit the old assignment") should not generate actionable tasks
+    for pat in NEGATIVE_DIRECTIVE_PATTERNS:
+        if pat.search(clean):
+            return True
+    # Explicit imperative deadline directive overrides chatter heuristics
+    if IMPERATIVE_DIRECTIVE_PATTERN.search(clean):
+        return False
+    for pat in PAST_TENSE_COMPLETION_PATTERNS:
+        if pat.search(clean):
+            return True
+    for pat in DISCUSSION_WITHOUT_DELIVERABLE_PATTERNS:
+        if pat.search(clean):
+            return True
+    for pat in PEER_QUESTION_PATTERNS:
+        if pat.search(clean):
+            return True
+    return False
+
+
+def detect_update_type(text: str) -> str | None:
+    """Detect whether text represents an update, postponement, extension, cancellation, revision, etc."""
     if not text:
         return None
-
-    m = PATTERN_RELATIVE_WEEKDAY.search(text)
-    if not m:
-        return None
-
-    raw_snippet = m.group(0).strip()
-    modifier = (m.group("modifier") or "").lower()
-    weekday_str = m.group("weekday").lower()
-    target_w = WEEKDAY_MAP.get(weekday_str)
-    if target_w is None:
-        return None
-
-    if message_date is None:
-        return {
-            "date_text": raw_snippet,
-            "due_date": None,
-            "date_status": "needs_review",
-            "date_reasons": [
-                f"Relative weekday '{raw_snippet}' detected, but message timestamp date could not be parsed confidently."
-            ],
-        }
-
-    msg_w = message_date.weekday()
-    days_ahead = (target_w - msg_w) % 7
-    if days_ahead == 0:
-        days_ahead = 7
-
-    is_next = modifier == "next"
-    if is_next and (msg_w + days_ahead <= 6):
-        days_ahead += 7
-
-    resolved = message_date + timedelta(days=days_ahead)
-    return {
-        "date_text": raw_snippet,
-        "due_date": resolved.isoformat(),
-        "date_status": "resolved_from_message_date",
-        "date_reasons": [
-            f"Resolved relative weekday '{raw_snippet}' (+{days_ahead}d) using message timestamp date {message_date.isoformat()}."
-        ],
-    }
-
-
-def extract_time(text: str) -> dict[str, str | None]:
-    """Extract deadline or event time from text, returning raw text and normalized HH:MM."""
-    if not text:
-        return {"time_text": None, "deadline_time": None}
-
-    # 1. 12-hour format with minutes (e.g. 11:59 PM, 9:30 AM)
-    m = TIME_12H_WITH_MINUTES.search(text)
-    if m:
-        h = int(m.group("hour"))
-        minute = int(m.group("minute"))
-        ampm = m.group("ampm").replace(".", "").upper()
-        if ampm == "PM" and h != 12:
-            h += 12
-        elif ampm == "AM" and h == 12:
-            h = 0
-        return {
-            "time_text": m.group(0).strip(),
-            "deadline_time": f"{h:02d}:{minute:02d}",
-        }
-
-    # 2. 12-hour format without minutes (e.g. 5 PM, 9 AM)
-    m = TIME_12H_NO_MINUTES.search(text)
-    if m:
-        h = int(m.group("hour"))
-        ampm = m.group("ampm").replace(".", "").upper()
-        if ampm == "PM" and h != 12:
-            h += 12
-        elif ampm == "AM" and h == 12:
-            h = 0
-        return {
-            "time_text": m.group(0).strip(),
-            "deadline_time": f"{h:02d}:00",
-        }
-
-    # 3. 24-hour format HH:MM (e.g. 14:30, 23:59)
-    m = TIME_24H.search(text)
-    if m:
-        h = int(m.group("hour"))
-        minute = int(m.group("minute"))
-        return {
-            "time_text": m.group(0).strip(),
-            "deadline_time": f"{h:02d}:{minute:02d}",
-        }
-
-    return {"time_text": None, "deadline_time": None}
-
-
-def detect_all_dates(text: str, timestamp_text: str) -> list[dict[str, Any]]:
-    """Detect all date expressions in text, resolving dates and preserving spans."""
-    if not text:
-        return []
-
-    message_date = parse_message_date(timestamp_text)
-    candidates: list[dict[str, Any]] = []
-
-    # Priority 1: Day Month Year (e.g. 24 October 2026, 20 November 2026)
-    for m in PATTERN_DAY_MONTH_YEAR.finditer(text):
-        raw_snippet = m.group(0).strip()
-        cleaned = _clean_ordinal(raw_snippet)
-        for fmt in ("%d %B %Y", "%d %b %Y", "%d of %B %Y", "%d of %b %Y"):
-            try:
-                dt = datetime.strptime(cleaned, fmt).date()
-                candidates.append({
-                    "start": m.start(),
-                    "end": m.end(),
-                    "priority": 1,
-                    "date_text": raw_snippet,
-                    "due_date": dt.isoformat(),
-                    "date_status": "parsed",
-                    "date_reasons": ["Explicit date with year detected and validated."],
-                })
-                break
-            except ValueError:
-                continue
-
-    # Priority 2: Month Day Year (e.g. October 24, 2026, December 5, 2026)
-    for m in PATTERN_MONTH_DAY_YEAR.finditer(text):
-        raw_snippet = m.group(0).strip()
-        cleaned = _clean_ordinal(raw_snippet).replace(",", "")
-        for fmt in ("%B %d %Y", "%b %d %Y"):
-            try:
-                dt = datetime.strptime(cleaned, fmt).date()
-                candidates.append({
-                    "start": m.start(),
-                    "end": m.end(),
-                    "priority": 2,
-                    "date_text": raw_snippet,
-                    "due_date": dt.isoformat(),
-                    "date_status": "parsed",
-                    "date_reasons": ["Explicit date with year detected and validated."],
-                })
-                break
-            except ValueError:
-                continue
-
-    # Priority 3: Numeric Full (e.g. 28/10/2026, 28-10-2026, 28.10.2026, 2026-10-28)
-    for num_match in PATTERN_NUMERIC_FULL.finditer(text):
-        p1 = num_match.group("p1")
-        p2 = num_match.group("p2")
-        p3 = num_match.group("p3")
-        raw_snippet = num_match.group(0).strip()
-
-        # ISO YYYY-MM-DD
-        if len(p1) == 4:
-            try:
-                dt = datetime.strptime(raw_snippet, "%Y-%m-%d").date()
-                candidates.append({
-                    "start": num_match.start(),
-                    "end": num_match.end(),
-                    "priority": 3,
-                    "date_text": raw_snippet,
-                    "due_date": dt.isoformat(),
-                    "date_status": "parsed",
-                    "date_reasons": ["ISO date detected and validated."],
-                })
-                continue
-            except ValueError:
-                pass
-
-        v1 = int(p1)
-        v2 = int(p2)
-
-        # Ambiguous DD/MM vs MM/DD
-        if v1 <= 12 and v2 <= 12 and v1 != v2:
-            candidates.append({
-                "start": num_match.start(),
-                "end": num_match.end(),
-                "priority": 3,
-                "date_text": raw_snippet,
-                "due_date": None,
-                "date_status": "needs_review",
-                "date_reasons": [
-                    f"Numeric date '{raw_snippet}' is ambiguous between DD/MM and MM/DD format."
-                ],
-            })
-            continue
-
-        year_len = len(p3)
-        sep = "/" if "/" in raw_snippet else ("-" if "-" in raw_snippet else ".")
-
-        # Unambiguous DD/MM
-        if v1 > 12 and v2 <= 12:
-            fmt = f"%d{sep}%m{sep}%Y" if year_len == 4 else f"%d{sep}%m{sep}%y"
-            try:
-                dt = datetime.strptime(raw_snippet, fmt).date()
-                candidates.append({
-                    "start": num_match.start(),
-                    "end": num_match.end(),
-                    "priority": 3,
-                    "date_text": raw_snippet,
-                    "due_date": dt.isoformat(),
-                    "date_status": "parsed",
-                    "date_reasons": ["Unambiguous day-first numeric date parsed."],
-                })
-                continue
-            except ValueError:
-                pass
-
-        # Unambiguous MM/DD
-        if v1 <= 12 and v2 > 12:
-            fmt = f"%m{sep}%d{sep}%Y" if year_len == 4 else f"%m{sep}%d{sep}%y"
-            try:
-                dt = datetime.strptime(raw_snippet, fmt).date()
-                candidates.append({
-                    "start": num_match.start(),
-                    "end": num_match.end(),
-                    "priority": 3,
-                    "date_text": raw_snippet,
-                    "due_date": dt.isoformat(),
-                    "date_status": "parsed",
-                    "date_reasons": ["Unambiguous month-first numeric date parsed."],
-                })
-                continue
-            except ValueError:
-                pass
-
-        # Identical day and month
-        if v1 == v2 and v1 <= 12:
-            fmt = f"%d{sep}%m{sep}%Y" if year_len == 4 else f"%d{sep}%m{sep}%y"
-            try:
-                dt = datetime.strptime(raw_snippet, fmt).date()
-                candidates.append({
-                    "start": num_match.start(),
-                    "end": num_match.end(),
-                    "priority": 3,
-                    "date_text": raw_snippet,
-                    "due_date": dt.isoformat(),
-                    "date_status": "parsed",
-                    "date_reasons": ["Identical day and month numeric date parsed."],
-                })
-                continue
-            except ValueError:
-                pass
-
-        # Fallback numeric
-        candidates.append({
-            "start": num_match.start(),
-            "end": num_match.end(),
-            "priority": 3,
-            "date_text": raw_snippet,
-            "due_date": None,
-            "date_status": "needs_review",
-            "date_reasons": [f"Numeric date '{raw_snippet}' could not be parsed confidently."],
-        })
-
-    # Priority 4: Relative day expressions ("day after tomorrow", "tomorrow", "today", "tonight")
     lowered = text.lower()
-    for phrase in ("day after tomorrow", "tomorrow", "today", "tonight"):
-        for m in re.finditer(rf"\b{re.escape(phrase)}\b", lowered):
-            if message_date is not None:
-                offset = RELATIVE_DAYS[phrase]
-                resolved = message_date + timedelta(days=offset)
-                candidates.append({
-                    "start": m.start(),
-                    "end": m.end(),
-                    "priority": 4,
-                    "date_text": phrase,
-                    "due_date": resolved.isoformat(),
-                    "date_status": "resolved_from_message_date",
-                    "date_reasons": [
-                        f"Resolved relative expression '{phrase}' (+{offset}d) using message timestamp date {message_date.isoformat()}."
-                    ],
-                })
-            else:
-                candidates.append({
-                    "start": m.start(),
-                    "end": m.end(),
-                    "priority": 4,
-                    "date_text": phrase,
-                    "due_date": None,
-                    "date_status": "needs_review",
-                    "date_reasons": [
-                        f"Relative date '{phrase}' detected, but message timestamp date could not be parsed confidently."
-                    ],
-                })
-
-    # Priority 5: Month + Day WITHOUT Year (Requirement: do not invent a year!)
-    for pat in (PATTERN_DAY_MONTH_NO_YEAR, PATTERN_MONTH_DAY_NO_YEAR):
-        for m in pat.finditer(text):
-            raw_snippet = m.group(0).strip()
-            candidates.append({
-                "start": m.start(),
-                "end": m.end(),
-                "priority": 5,
-                "date_text": raw_snippet,
-                "due_date": None,
-                "date_status": "needs_review",
-                "date_reasons": [
-                    f"Date '{raw_snippet}' specifies day and month without a year. SMART does not assume a year."
-                ],
-            })
-
-    # Priority 6: Relative weekdays (e.g. Friday, Monday, next Monday, next Friday)
-    for m in PATTERN_RELATIVE_WEEKDAY.finditer(text):
-        raw_snippet = m.group(0).strip()
-        weekday_info = resolve_weekday(raw_snippet, message_date)
-        if weekday_info:
-            candidates.append({
-                "start": m.start(),
-                "end": m.end(),
-                "priority": 6,
-                "date_text": weekday_info["date_text"],
-                "due_date": weekday_info["due_date"],
-                "date_status": weekday_info["date_status"],
-                "date_reasons": weekday_info["date_reasons"],
-            })
-
-    # Filter overlaps: sort candidates by priority (lower number = higher priority), then length descending
-    candidates.sort(key=lambda c: (c["priority"], -(c["end"] - c["start"])))
-
-    accepted: list[dict[str, Any]] = []
-    for cand in candidates:
-        c_start, c_end = cand["start"], cand["end"]
-        overlaps = False
-        for acc in accepted:
-            a_start, a_end = acc["start"], acc["end"]
-            if not (c_end <= a_start or c_start >= a_end):
-                overlaps = True
-                break
-            # Suppress weekday immediately preceding an explicit date (e.g. "Friday, 20 November")
-            if cand["priority"] == 6 and 0 <= (a_start - c_end) <= 4:
-                overlaps = True
-                break
-        if not overlaps:
-            accepted.append(cand)
-
-    accepted.sort(key=lambda c: c["start"])
-    return accepted
+    # 1. Cancellation
+    if re.search(r"\b(?:cancelled|canceled|cancellation|classes?\s+(?:are\s+)?suspended|suspended\s+until|called\s+off|deadline\s+(?:is\s+)?cancelled|exam\s+(?:is\s+)?cancelled)\b", lowered):
+        return "cancellation"
+    # 2. Confirmation
+    if re.search(r"\b(?:confirms?|confirmation|remains?\s+unchanged|no\s+change\s+in\s+deadline|deadline\s+stands|remains?\s+as\s+scheduled|unaltered|deadline\s+is\s+confirmed|deadline\s+remains?)\b", lowered):
+        return "confirmation"
+    # 3. Extension
+    if re.search(r"\b(?:deadline\s+)?(?:extended|extension|last\s+date\s+extended)\b", lowered):
+        return "extension"
+    # 4. Postponement
+    if re.search(r"\b(?:postponed|postponement|deferred|put\s+on\s+hold|pushed\s+back)\b", lowered):
+        return "postponement"
+    # 5. Rescheduled
+    if re.search(r"\b(?:rescheduled|reschedule)\b", lowered):
+        return "rescheduled"
+    # 6. Revision
+    if re.search(r"\b(?:revised|revision|amended)\s+(?:deadline|schedule|date|timetable|submission)\b|\b(?:deadline|date|submission\s+date)\s+(?:has\s+been\s+|is\s+)?(?:revised|amended)\b", lowered):
+        return "revision"
+    # 7. Replacement
+    if re.search(r"\b(?:replacing|superseding|in\s+lieu\s+of|replaces\s+the|new\s+deadline\s+replaces)\b", lowered):
+        return "replacement"
+    # 8. Window Change
+    if re.search(r"\b(?:submission\s+window|window\s+is\s+(?:now\s+)?open|window\s+extended|portal\s+is\s+open)\b", lowered):
+        return "window_change"
+    return None
 
 
-def detect_date(text: str, timestamp_text: str) -> dict[str, Any]:
-    """Detect and evaluate dates from message text and timestamp.
+def detect_actionability(
+    category: str,
+    text: str,
+    date_type: str,
+    date_status: str,
+    update_type: str | None,
+) -> tuple[bool, str]:
+    """Determine whether extracted academic information requires student action or is informational."""
+    # Confirmations, cancellations, and indefinite postponements without a scheduled date are informational
+    if update_type in ("cancellation", "confirmation"):
+        return False, "informational"
+    if update_type == "postponement" and date_status in ("not_found", "needs_review"):
+        return False, "informational"
 
-    Returns:
-    - date_text: original date string or phrase found in text
-    - due_date: ISO date string (YYYY-MM-DD) if confidently parsed, else None
-    - date_status: 'parsed' | 'resolved_from_message_date' | 'needs_review' | 'not_found'
-    - date_reasons: list of explanations for uncertainty or status
-    """
-    all_dates = detect_all_dates(text, timestamp_text)
-    if not all_dates:
-        return {
-            "date_text": None,
-            "due_date": None,
-            "date_status": "not_found",
-            "date_reasons": [],
-        }
+    # Announcements without direct action imperatives are informational
+    if category == "Announcement":
+        if re.search(r"\b(?:must|mandatory|required\s+to|action\s+required|please\s+submit|register\s+now)\b", text, re.I):
+            return True, "action_required"
+        return False, "informational"
 
-    if len(all_dates) == 1:
-        return {
-            "date_text": all_dates[0]["date_text"],
-            "due_date": all_dates[0]["due_date"],
-            "date_status": all_dates[0]["date_status"],
-            "date_reasons": all_dates[0]["date_reasons"],
-        }
+    # Assignments and exams require student preparation or submission action
+    if category in ("Assignment", "Exam"):
+        return True, "action_required"
 
-    # Multiple dates: check if they resolve to the exact same date
-    distinct_resolved = {d.get("due_date") for d in all_dates if d.get("due_date") is not None}
-    distinct_raw = {d.get("date_text") for d in all_dates if d.get("date_text") is not None}
-    if len(distinct_resolved) == 1 and len(distinct_raw) == 1:
-        return {
-            "date_text": all_dates[0]["date_text"],
-            "due_date": all_dates[0]["due_date"],
-            "date_status": all_dates[0]["date_status"],
-            "date_reasons": all_dates[0]["date_reasons"],
-        }
+    # Opportunities (hackathons, internships, jobs)
+    if category == "Opportunity":
+        if date_type == "deadline" or re.search(r"\b(?:apply|register|submission)\b", text, re.I):
+            return True, "action_required"
+        return False, "fyi"
 
-    # Truly multiple dates in one text: ambiguous association
-    date_snippets = [d["date_text"] for d in all_dates if d.get("date_text")]
-    return {
-        "date_text": ", ".join(date_snippets),
-        "due_date": None,
-        "date_status": "needs_review",
-        "date_reasons": [
-            f"Multiple candidate dates detected in task text ({', '.join(date_snippets)}); marked for human review."
-        ],
-    }
+    # Events (workshops, seminars)
+    if category == "Event":
+        if re.search(r"\b(?:register|registration|mandatory|attendance\s+is\s+compulsory)\b", text, re.I):
+            return True, "action_required"
+        return False, "informational"
+
+    return True, "action_required"
 
 
 def classify_message(text: str) -> tuple[str | None, list[str]]:
@@ -685,6 +401,20 @@ def classify_message(text: str) -> tuple[str | None, list[str]]:
 
     if not matches:
         return None, []
+
+    # Contextual intelligence: if postponement or cancellation announcement without an explicit new date,
+    # classify as Announcement rather than Exam or Assignment (e.g. 'The exam was postponed.')
+    up_type = detect_update_type(text)
+    if up_type in ("postponement", "cancellation"):
+        has_explicit_date = bool(
+            PATTERN_DAY_MONTH_YEAR.search(text)
+            or PATTERN_MONTH_DAY_YEAR.search(text)
+            or PATTERN_NUMERIC_FULL.search(text)
+        )
+        if not has_explicit_date:
+            if "Announcement" not in matches:
+                matches.append("Announcement")
+            return "Announcement", matches
 
     # Priority ordering when multiple match
     priority_order = ["Assignment", "Exam", "Opportunity", "Event", "Announcement"]
@@ -722,7 +452,7 @@ _PREP_OPP_CONTEXT = re.compile(
 _PRIMARY_ASSIGNMENT_ACTION = re.compile(
     r"\b(?:submits?|submitted|submitting|due|coursework|homework|"
     r"lab\s+(?:report|record|manual|exercise|submission)|"
-    r"project\s+(?:report|submission|demo))\b",
+    r"project\s+(?:report|submission|demo|proposal))\b",
     re.IGNORECASE,
 )
 
@@ -791,6 +521,10 @@ def calculate_confidence(
     # 1. Ambiguous or incomplete date -> LOW
     if date_status == "needs_review":
         reasons.append("Date expression is ambiguous, incomplete, or requires human confirmation.")
+        date_reasons = date_info.get("date_reasons") or []
+        for dr in date_reasons:
+            if dr not in reasons:
+                reasons.append(dr)
         return "LOW", reasons
 
     # 2. Category conflict analysis — distinguish genuine conflicts from contextual co-occurrence
@@ -844,27 +578,30 @@ def calculate_confidence(
 # Does NOT split dates like "Friday, 20 November 2026" or "November 20, 2026".
 _COMMA_ACADEMIC_SPLIT = re.compile(
     r",\s*(?="
+    r"(?:(?:also|please|kindly|additionally|remember\s+to|make\s+sure\s+to)\s+)*"
     r"(?:(?:the|an|a|your|our|final|internal|semester|next|upcoming|this)\s+)?"
+    r"(?:(?:semester|midterm|final|internal|upcoming|next|model|online|revised|regular)\s+)?"
     r"(?:[A-Za-z0-9_-]+\s+)?"
     r"(?:exam|examination|test|quiz|assignment|homework|submission|"
     r"lab\s+(?:record|manual|report|exercise|submission)|"
-    r"project\s+(?:submission|report|deadline|demo|presentation)|"
+    r"project\s+(?:submission|report|deadline|demo|presentation|proposal)|"
     r"workshop|seminar|webinar|conference|hackathon|internship)\b"
-    r"|(?:please\s+)?(?:submit|register|apply|attend|prepare)\b"
+    r"|(?:(?:also|please|kindly|additionally|remember\s+to|make\s+sure\s+to)\s+)*(?:submit|register|apply|attend|prepare|complete|upload)\b"
     r")",
     re.IGNORECASE,
 )
 
-# Conjunction split pattern for splitting on "and/but" before independent academic tasks.
-# The lookahead allows one optional descriptor word (e.g. "semester", "final", "midterm")
-# between the article/preposition and the core academic noun.
+# Conjunction split pattern for splitting on "and/but/while/as well as" before independent academic tasks.
+# Supports optional comma prefix before conjunction (e.g. ", but the online assignment...") and descriptor modifiers.
 _CONJ_ACADEMIC_SPLIT = re.compile(
-    r"\s+(?:and|but|while)\s+(?="
+    r"(?:,\s*)?\s+(?:and|but|while|as\s+well\s+as|along\s+with)\s+(?="
+    r"(?:[^\w\s]+\s*)*"
+    r"(?:(?:also|please|kindly|additionally|remember\s+to|make\s+sure\s+to)\s+)*"
     r"(?:the\s+)?"
-    r"(?:prepare\s+(?:for\s+)?|attend\s+|register\s+(?:for\s+)?|submit\s+|write\s+)?"
-    r"(?:(?:the|a|an|your|our)\s+)?"
-    r"(?:semester|midterm|final|internal|upcoming|next|model)?\s*"
-    r"(?:assignment|exam|examination|test|quiz|workshop|seminar|conference|hackathon|internship|submission|registration)\b"
+    r"(?:prepare\s+(?:for\s+)?|attend\s+|register\s+(?:for\s+)?|submit\s+|write\s+|complete\s+|upload\s+)?"
+    r"(?:(?:the|a|an|your|our|this)\s+)?"
+    r"(?:semester|midterm|final|internal|upcoming|next|model|online|revised|regular)?\s*"
+    r"(?:assignment|exam|examination|test|quiz|workshop|seminar|conference|hackathon|internship|submission|registration|lab|project)\b"
     r")",
     re.IGNORECASE,
 )
@@ -947,9 +684,13 @@ def extract_academic_items(messages: list[dict[str, Any]]) -> list[dict[str, Any
     """
     items: list[dict[str, Any]] = []
 
-    for message in messages:
-        sender = message.get("sender", "System")
-        text = message.get("text", "")
+    for raw_msg in messages:
+        message = raw_msg.to_dict() if hasattr(raw_msg, "to_dict") else raw_msg
+        sender = message.get("sender") or message.get("source_sender") or "System"
+        text = message.get("text") or message.get("source_text") or ""
+        source_type = message.get("source_type", "whatsapp")
+        source_id = message.get("source_id")
+        source_metadata = message.get("source_metadata") or {}
 
         # System notifications (encryption, user added, etc.) are not academic items.
         if sender == "System":
@@ -960,10 +701,14 @@ def extract_academic_items(messages: list[dict[str, Any]]) -> list[dict[str, Any
         if msg_category is None:
             continue
 
-        timestamp_text = message.get("timestamp_text", "")
+        timestamp_text = message.get("timestamp_text") or message.get("source_timestamp") or ""
 
         # Segment message into sentences / clauses
         segments = split_message_into_segments(text)
+
+        # If all segments are conversational chatter, ignore message
+        if all(is_conversational_chatter(s) for s in segments):
+            continue
 
         # Cluster segments into academic tasks
         task_clusters: list[list[str]] = []
@@ -973,6 +718,9 @@ def extract_academic_items(messages: list[dict[str, Any]]) -> list[dict[str, Any
         current_date_type: str = "none"
 
         for seg in segments:
+            # Skip conversational chatter segments within a message
+            if is_conversational_chatter(seg):
+                continue
             cat, _ = classify_message(seg)
             date_info = detect_date(seg, timestamp_text)
             has_deadline_lang = any(pat.search(seg) for pat in DEADLINE_INDICATORS)
@@ -1084,6 +832,39 @@ def extract_academic_items(messages: list[dict[str, Any]]) -> list[dict[str, Any
             else:
                 date_type = "none"
 
+            # Distinguish date resolution from temporal meaning:
+            # 1. Historical events ("was conducted yesterday", "workshop happened yesterday"):
+            #    Not an automatically created pending deadline -> due_date is None, date_type="event_date", is_actionable=False.
+            # 2. Past deadlines ("assignment deadline was yesterday"):
+            #    Past deadline preserved as due_date (not an invented future date), but is_actionable=False, review_required=True.
+            is_past_text = any(pat.search(cluster_text) for pat in HISTORICAL_PAST_PATTERNS)
+            message_date = parse_reference_timestamp(timestamp_text)
+            is_past_date = False
+            if date_info["due_date"] is not None and message_date is not None:
+                try:
+                    due_d = datetime.strptime(date_info["due_date"], "%Y-%m-%d").date()
+                    if due_d < message_date:
+                        is_past_date = True
+                except ValueError:
+                    pass
+            elif date_info["date_text"] and "yesterday" in date_info["date_text"].lower():
+                is_past_date = True
+
+            is_historical_event = (is_past_text or is_past_date) and category in ("Event", "Exam", "Announcement") and not has_deadline_language
+            is_past_deadline = (is_past_text or is_past_date) and has_deadline_language
+
+            if is_historical_event:
+                date_type = "event_date"
+                item_due_date = None  # Do not force historical event dates into due_date
+                item_date_status = date_info["date_status"]
+            elif is_past_deadline:
+                date_type = "deadline"
+                item_due_date = date_info["due_date"]  # Preserve past deadline without inventing a future date
+                item_date_status = "needs_review"
+            else:
+                item_due_date = date_info["due_date"]
+                item_date_status = date_info["date_status"]
+
             # Check weak event match
             is_isolated_event_keyword = False
             if category == "Event":
@@ -1101,8 +882,12 @@ def extract_academic_items(messages: list[dict[str, Any]]) -> list[dict[str, Any
             review_reasons: list[str] = list(date_info.get("date_reasons", []))
             review_required = False
 
-            if date_info["date_status"] == "needs_review":
+            if item_date_status == "needs_review":
                 review_required = True
+
+            if is_past_deadline:
+                review_required = True
+                review_reasons.append("Deadline is in the past relative to the message timestamp.")
 
             if category == "Assignment" and date_type == "mentioned_date":
                 review_required = True
@@ -1140,6 +925,53 @@ def extract_academic_items(messages: list[dict[str, Any]]) -> list[dict[str, Any
 
             review_reasons = list(dict.fromkeys(review_reasons))
 
+            # Intelligence heuristics: actionability and update categorization
+            update_type = detect_update_type(cluster_text)
+            previous_due_date = None
+            item_date_text = date_info["date_text"]
+
+            if update_type:
+                trans = extract_update_transition_dates(cluster_text, timestamp_text)
+                if trans:
+                    if trans.get("previous_date"):
+                        previous_due_date = trans["previous_date"]
+                    elif trans.get("previous_date_text"):
+                        previous_due_date = trans["previous_date_text"]
+                    if trans.get("new_date"):
+                        item_due_date = trans["new_date"]
+                        item_date_status = trans["new_date_status"]
+                    if trans.get("new_date_text"):
+                        item_date_text = trans["new_date_text"]
+
+                if update_type == "cancellation":
+                    item_due_date = None
+                    item_date_status = "not_found"
+                    date_type = "none"
+                    is_actionable = False
+                    actionability_type = "informational"
+                    review_required = True
+                    review_reasons.append("Deadline or academic event cancelled by notice.")
+                elif update_type == "confirmation":
+                    if not item_due_date and date_info["date_status"] == "not_found":
+                        is_actionable = False
+                        actionability_type = "informational"
+                elif update_type == "window_change":
+                    date_type = "deadline"
+                    is_actionable = True
+                    actionability_type = "action_required"
+
+            if is_historical_event or is_past_deadline:
+                is_actionable = False
+                actionability_type = "informational"
+            else:
+                is_actionable, actionability_type = detect_actionability(
+                    category=category,
+                    text=cluster_text,
+                    date_type=date_type,
+                    date_status=item_date_status,
+                    update_type=update_type,
+                )
+
             # Construct title
             lines = [l.strip() for l in cluster if l.strip()]
             title = lines[0][:120].strip() if lines else cluster_text[:120].strip()
@@ -1148,27 +980,77 @@ def extract_academic_items(messages: list[dict[str, Any]]) -> list[dict[str, Any
                 "item_id": message.get("message_id", len(items) + 1),
                 "category": category,
                 "title": title or "Untitled candidate message",
-                "date_text": date_info["date_text"],
-                "due_date": date_info["due_date"],
-                "date_status": date_info["date_status"],
+                "date_text": item_date_text,
+                "due_date": item_due_date,
+                "date_status": item_date_status,
                 "date_type": date_type,
+                "is_range": bool(date_info.get("is_range", False)),
                 "time_text": time_info["time_text"],
                 "deadline_time": time_info["deadline_time"],
+                "previous_due_date": previous_due_date,
                 "urls": urls,
                 "evidence_text": cluster_text,
                 "evidence_start_index": evidence_start_index,
                 "evidence_end_index": evidence_end_index,
                 "confidence": confidence,
                 "confidence_reasons": confidence_reasons,
+                "is_actionable": is_actionable,
+                "actionability_type": actionability_type,
+                "update_type": update_type,
                 "source_message_id": message.get("message_id"),
                 "source_sender": sender,
                 "source_timestamp": timestamp_text,
                 "source_text": text,
                 "source_filename": message.get("source_filename") or message.get("filename") or "",
+                "source_type": source_type,
+                "source_id": source_id,
+                "source_metadata": source_metadata,
                 "extraction_method": "rules",
                 "review_required": review_required,
                 "review_reasons": review_reasons,
             }
+
+            intent, intent_reasons = classify_academic_intent(
+                category=category,
+                title=title,
+                text=cluster_text,
+                actionability_type=actionability_type,
+            )
+            importance, importance_reasons = assess_academic_importance(
+                category=category,
+                academic_intent=intent,
+                title=title,
+                text=cluster_text,
+                is_actionable=is_actionable,
+                status="pending",
+            )
+            urgency, urgency_reasons, delta_days = assess_task_urgency(
+                due_date=item_due_date,
+                date_status=item_date_status,
+                status="pending",
+                current_date=None,
+                text=cluster_text,
+            )
+            priority, priority_reasons = calculate_priority(
+                urgency=urgency,
+                importance=importance,
+                is_actionable=is_actionable,
+                status="pending",
+                date_status=item_date_status,
+                delta_days=delta_days,
+                review_required=review_required,
+            )
+
+            item["academic_intent"] = intent
+            item["academic_intent_reasons"] = intent_reasons
+            item["importance"] = importance
+            item["importance_reasons"] = importance_reasons
+            item["urgency"] = urgency
+            item["urgency_reasons"] = urgency_reasons
+            item["delta_days"] = delta_days
+            item["priority"] = priority
+            item["priority_reasons"] = priority_reasons
+
             item["candidate_token"] = create_candidate_token(item)
             items.append(item)
 

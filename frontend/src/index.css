@@ -1,48 +1,82 @@
 :root {
-  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  /* Design Tokens from SMART UI/UX Redesign Specification */
+  --primary: #7048E8;
+  --primary-hover: #5D35D0;
+  --sidebar-start: #4321B0;
+  --sidebar-end: #814FEE;
+
+  --background: #F6F7FB;
+  --surface: #FFFFFF;
+  --surface-muted: #F0EBFF;
+
+  --text-primary: #202033;
+  --text-secondary: #77788B;
+  --text-muted: #A0A1B2;
+
+  --border: #ECECF3;
+
+  --success: #24C78A;
+  --warning: #F4A340;
+  --danger: #F06475;
+  --info: #5795ED;
+
+  --chart-purple: #7048E8;
+  --chart-green: #24C78A;
+  --chart-orange: #F4A340;
+
+  /* Layout */
+  --sidebar-width: 260px;
+  --topbar-height: 72px;
+  --content-padding: 30px;
+  --card-gap: 20px;
+
+  /* Border Radius */
+  --radius-sm: 9px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius-xl: 20px;
+
+  /* Shadows */
+  --card-shadow: 0 4px 18px rgba(31, 25, 72, 0.06);
+  --floating-shadow: 0 12px 36px rgba(25, 20, 60, 0.14);
+
+  /* Legacy & Semantic Aliases for Compatibility */
+  --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
 
-  /* Color Palette - Academic Productivity */
-  --bg-app: #f8fafc;
-  --bg-card: #ffffff;
-  --bg-muted: #f1f5f9;
-  --bg-subtle: #f8fafc;
+  --bg-app: var(--background);
+  --bg-card: var(--surface);
+  --bg-muted: var(--surface-muted);
+  --bg-subtle: #F9FAFD;
 
-  --border-light: #e2e8f0;
-  --border-subtle: #cbd5e1;
+  --border-light: var(--border);
+  --border-subtle: #DFDFEB;
 
-  --text-main: #0f172a;
-  --text-muted: #475569;
-  --text-dim: #64748b;
+  --text-main: var(--text-primary);
+  --text-dim: var(--text-secondary);
 
-  --primary: #2563eb;
-  --primary-hover: #1d4ed8;
-  --primary-light: #eff6ff;
-  --primary-border: #bfdbfe;
+  --primary-light: var(--surface-muted);
+  --primary-border: #D8CCFD;
 
-  --amber-bg: #fef3c7;
-  --amber-text: #92400e;
-  --amber-border: #fcd34d;
+  --amber-bg: #FEF6EB;
+  --amber-text: #B25E09;
+  --amber-border: #FCD8B0;
 
-  --rose-bg: #ffe4e6;
-  --rose-text: #9f1239;
-  --rose-border: #fecdd3;
+  --rose-bg: #FEECEF;
+  --rose-text: #BE1834;
+  --rose-border: #FCAEB9;
 
-  --emerald-bg: #d1fae5;
-  --emerald-text: #065f46;
-  --emerald-border: #a7f3d0;
+  --emerald-bg: #E8F9F3;
+  --emerald-text: #0E7B53;
+  --emerald-border: #A6EBD2;
 
-  --indigo-bg: #e0e7ff;
-  --indigo-text: #3730a3;
-  --indigo-border: #c7d2fe;
+  --indigo-bg: var(--surface-muted);
+  --indigo-text: var(--sidebar-start);
+  --indigo-border: #D4C4FD;
 
-  --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
-  --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.07), 0 2px 4px -2px rgba(0, 0, 0, 0.05);
-  --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.08), 0 4px 6px -4px rgba(0, 0, 0, 0.04);
-
-  --radius-sm: 6px;
-  --radius-md: 10px;
-  --radius-lg: 14px;
+  --shadow-sm: 0 1px 3px rgba(31, 25, 72, 0.04);
+  --shadow-md: var(--card-shadow);
+  --shadow-lg: var(--floating-shadow);
 }
 
 *, *::before, *::after {
@@ -52,10 +86,10 @@
 html, body {
   margin: 0;
   padding: 0;
-  background-color: var(--bg-app);
-  color: var(--text-main);
+  background-color: var(--background);
+  color: var(--text-primary);
   font-family: var(--font-sans);
-  font-size: 15px;
+  font-size: 14px;
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
@@ -71,6 +105,10 @@ button {
   font-family: inherit;
 }
 
+input, select, textarea {
+  font-family: inherit;
+}
+
 a {
   color: var(--primary);
   text-decoration: none;
@@ -78,9 +116,4 @@ a {
 
 a:hover {
   text-decoration: underline;
-}
-
-:focus-visible {
-  outline: 2px solid var(--primary);
-  outline-offset: 2px;
 }
