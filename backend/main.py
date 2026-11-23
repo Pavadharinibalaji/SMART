@@ -7,24 +7,32 @@ RFC 5545 iCalendar export.
 
 from __future__ import annotations
 
+import config  # Ensures root .env is loaded before accessing environment variables
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 import os
+from pathlib import Path
 from typing import Any, Optional
+import urllib.parse
+import uuid
 
 from fastapi import (
     Cookie,
     Depends,
     FastAPI,
     File,
+    Form,
     Header,
     HTTPException,
     Query,
     Request,
     Response,
     UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
     status,
 )
+from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -35,36 +43,92 @@ from database import (
     ALLOWED_IMPORTANCE_LEVELS,
     ALLOWED_SOURCE_TYPES,
     ALLOWED_STATUSES,
+    accept_course_invitation,
+    acknowledge_announcement,
+    check_and_dispatch_opportunity_reminders,
+    close_course_poll,
+    create_course_announcement,
+    create_course_invitation,
+    create_course_poll,
+    create_notification,
+    create_smart_course,
     create_user_session,
     delete_academic_item,
+    delete_course_material,
     delete_google_account,
+    delete_tracked_opportunity,
     delete_user_session,
+    enroll_student_by_join_code,
     find_associated_task,
     find_duplicate_item,
     get_academic_item_by_id,
     get_confirmed_deadline_items,
+    get_course_enrolled_student_ids,
+    get_course_engagement_analytics,
+    get_course_material,
+    get_course_opportunities_analytics,
     get_google_account,
+    get_poll_details,
     get_session_with_user,
+    get_smart_course,
+    get_smart_course_by_code,
+    get_smart_course_by_join_code,
+    get_student_personal_analytics,
     get_task_relationships,
     get_teacher_coursework_overview,
     get_teacher_opportunities_overview,
+    get_tracked_opportunity,
+    get_unread_message_count,
+    get_unread_notification_count,
     get_user_by_email,
     get_user_by_id,
+    grade_classroom_submission,
     init_db,
+    is_user_course_teacher,
+    is_user_enrolled,
     is_valid_iso_date,
     list_academic_items,
     list_classroom_courses,
     list_classroom_coursework,
     list_classroom_submissions,
+    list_course_announcements,
+    list_course_invitations,
+    list_course_materials,
+    list_course_members,
+    list_course_messages,
+    list_course_opportunity_participations,
+    list_course_polls,
     list_opportunities,
+    list_student_pending_invitations,
+    list_student_tracked_opportunities,
     list_study_materials,
+    list_user_notifications,
+    list_user_smart_courses,
+    mark_all_notifications_read,
+    mark_messages_read,
+    mark_notification_read,
+    provision_user,
+    regenerate_course_join_code,
+    remove_student_from_course,
     save_academic_item,
     save_academic_item_with_association,
+    save_course_material,
+    save_course_message,
     save_opportunity,
     save_study_material,
+    save_tracked_opportunity,
+    submit_poll_vote,
+    turn_in_classroom_submission,
     update_academic_item,
     update_academic_item_status,
+    update_course_material,
+    update_smart_course,
     update_student_opportunity_status,
+    update_tracked_opportunity,
+    update_user_profile,
+    VALID_MATERIAL_CATEGORIES,
+    VALID_OPPORTUNITY_CATEGORIES,
+    VALID_TRACKING_STATUSES,
 )
 from extractor import create_candidate_token, extract_academic_items, verify_candidate_token
 from google_service import (
@@ -80,6 +144,7 @@ from security import (
     generate_csrf_token,
     generate_session_id,
     sanitize_account_for_response,
+    verify_google_id_token,
 )
 from source_adapters import get_source_adapter
 
@@ -922,27 +987,45 @@ IS_PRODUCTION = SMART_ENV == "production"
 class LoginRequest(BaseModel):
     """Payload for user login / demo sign-in."""
     email: str
+    id_token: Optional[str] = None  # Google ID token required for institutional non-demo accounts
 
 
 def get_current_user_optional(
+    request: Request,
     smart_session: Optional[str] = Cookie(None, alias=SESSION_COOKIE_NAME),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+    x_session_id: Optional[str] = Header(None, alias="X-Session-ID"),
     x_user_role: Optional[str] = Header(None, alias="X-User-Role"),
     x_user_email: Optional[str] = Header(None, alias="X-User-Email"),
 ) -> Optional[dict[str, Any]]:
-    """Retrieve current authenticated user from session cookie.
+    """Retrieve current authenticated user from session cookie or header.
 
-    Falls back to provisioned user record matching legacy header only if no cookie
-    is present and the target user is active & provisioned (for test backward compatibility).
+    Falls back to provisioned user record matching legacy header only if no session
+    token is present and the target user is active & provisioned (for test backward compatibility).
     """
-    if smart_session:
-        session_data = get_session_with_user(smart_session)
+    token = smart_session or (request.cookies.get(SESSION_COOKIE_NAME) if request else None)
+    if not token and authorization and authorization.startswith("Bearer "):
+        token = authorization.split("Bearer ", 1)[1].strip()
+    if not token and x_session_id:
+        token = x_session_id.strip()
+
+    if token:
+        session_data = get_session_with_user(token)
         if session_data:
+            if "id" not in session_data and "user_id" in session_data:
+                session_data["id"] = session_data["user_id"]
+            if "user_id" not in session_data and "id" in session_data:
+                session_data["user_id"] = session_data["id"]
             return session_data
 
     # Controlled legacy fallback for test harnesses without cookies
     if x_user_email and not IS_PRODUCTION:
         user = get_user_by_email(x_user_email)
         if user and user.get("status") == "active":
+            if "id" not in user and "user_id" in user:
+                user["id"] = user["user_id"]
+            if "user_id" not in user and "id" in user:
+                user["user_id"] = user["id"]
             return user
         # Synthetic temporary profile if header specifies role
         role = (x_user_role or "student").strip().lower()
@@ -1006,6 +1089,22 @@ def login_user(payload: LoginRequest, response: Response) -> dict[str, Any]:
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Account is suspended or deactivated. Contact your institution administrator.",
         )
+
+    # For non-demo institutional accounts, verify cryptographic Google authentication proof
+    if not user.get("is_demo"):
+        id_token = payload.id_token
+        if not id_token:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Authentication proof required: Institutional accounts cannot authenticate by email alone. Please provide a verified Google ID token.",
+            )
+        try:
+            verify_google_id_token(id_token=id_token, expected_email=email)
+        except ValueError as err:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=f"Google authentication failed: {err}",
+            )
 
     session_id = generate_session_id()
     csrf_token = generate_csrf_token()
@@ -1106,6 +1205,17 @@ class StudyMaterialCreateRequest(BaseModel):
     course_name: Optional[str] = None
 
 
+class TurnInSubmissionRequest(BaseModel):
+    """Payload for turning in an assignment coursework submission."""
+    coursework_id: str = Field(..., min_length=1)
+    alternate_link: Optional[str] = None
+
+
+class GradeSubmissionRequest(BaseModel):
+    """Payload for grading an assignment submission."""
+    assigned_grade: float = Field(..., ge=0)
+
+
 class DemoToggleRequest(BaseModel):
     """Payload for enabling or resetting demo sample data."""
     enable: bool = True
@@ -1129,30 +1239,73 @@ async def handle_google_oauth_callback(
     code: Optional[str] = Query(None),
     state: Optional[str] = Query(None),
     error: Optional[str] = Query(None),
-) -> dict[str, Any]:
-    """Handle Google OAuth 2.0 redirect callback, validate CSRF state, and store tokens."""
+    raw: Optional[bool] = Query(False, description="Return raw JSON instead of redirecting to frontend"),
+) -> Any:
+    """Handle Google OAuth 2.0 redirect callback, validate CSRF state, and store tokens.
+
+    In browser flow, redirects back to the frontend workspace at http://localhost:5173 with status query param.
+    If raw=True or request asks for application/json without HTML, returns JSON.
+    """
+    frontend_base = os.environ.get("SMART_FRONTEND_URL", "http://localhost:5173").rstrip("/")
+
     if error:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Google OAuth authorization was denied or failed: {error}",
-        )
+        err_msg = f"Google OAuth authorization was denied or failed: {error}"
+        if raw:
+            raise HTTPException(status_code=400, detail=err_msg)
+        return RedirectResponse(url=f"{frontend_base}/?google_auth_error={urllib.parse.quote(err_msg)}")
+
     if not code or not state:
-        raise HTTPException(
-            status_code=400,
-            detail="Missing OAuth 'code' or 'state' query parameter in callback.",
-        )
+        err_msg = "Missing OAuth 'code' or 'state' query parameter in callback."
+        if raw:
+            raise HTTPException(status_code=400, detail=err_msg)
+        return RedirectResponse(url=f"{frontend_base}/?google_auth_error={urllib.parse.quote(err_msg)}")
 
     try:
         account = await exchange_code_for_tokens(code=code, state=state)
-        return {
-            "status": "connected",
-            "message": "Google account connected successfully.",
-            "account": sanitize_account_for_response(account),
-        }
+        redirect_res = RedirectResponse(url=f"{frontend_base}/?google_auth_success=1&email={urllib.parse.quote(account.get('email', ''))}")
+        # Synchronize Google profile name/picture to provisioned SMART user if available
+        if account.get("email"):
+            prov_user = get_user_by_email(account["email"])
+            if prov_user:
+                update_user_profile(
+                    user_id=prov_user["id"],
+                    name=account.get("name") or prov_user.get("name"),
+                    picture=account.get("picture") or prov_user.get("picture"),
+                )
+                if prov_user.get("status") == "active":
+                    session_id = generate_session_id()
+                    csrf_token = generate_csrf_token()
+                    expires_dt = datetime.now(timezone.utc) + timedelta(hours=SESSION_DURATION_HOURS)
+                    create_user_session(
+                        user_id=prov_user["id"],
+                        session_id=session_id,
+                        csrf_token=csrf_token,
+                        expires_at_iso=expires_dt.isoformat(),
+                    )
+                    redirect_res.set_cookie(
+                        key=SESSION_COOKIE_NAME,
+                        value=session_id,
+                        httponly=True,
+                        samesite="lax",
+                        secure=IS_PRODUCTION,
+                        max_age=SESSION_DURATION_HOURS * 3600,
+                        path="/",
+                    )
+        if raw:
+            return {
+                "status": "connected",
+                "message": "Google account connected successfully.",
+                "account": sanitize_account_for_response(account),
+            }
+        return redirect_res
     except ValueError as err:
-        raise HTTPException(status_code=400, detail=str(err))
+        if raw:
+            raise HTTPException(status_code=400, detail=str(err))
+        return RedirectResponse(url=f"{frontend_base}/?google_auth_error={urllib.parse.quote(str(err))}")
     except Exception as err:
-        raise HTTPException(status_code=500, detail=f"Failed to complete Google OAuth exchange: {err}")
+        if raw:
+            raise HTTPException(status_code=500, detail=f"Failed to complete Google OAuth exchange: {err}")
+        return RedirectResponse(url=f"{frontend_base}/?google_auth_error={urllib.parse.quote(f'Failed to complete Google OAuth exchange: {err}')}")
 
 
 @app.get("/api/auth/google/status")
@@ -1217,12 +1370,22 @@ def toggle_demo_data(payload: DemoToggleRequest) -> dict[str, Any]:
 @app.post("/api/sync/gmail")
 async def trigger_gmail_sync(
     max_messages: int = Query(15, ge=1, le=50),
+    current_user: Optional[dict[str, Any]] = Depends(get_current_user_optional),
     x_user_role: Optional[str] = Header("student", alias="X-User-Role"),
     x_user_email: Optional[str] = Header(None, alias="X-User-Email"),
 ) -> dict[str, Any]:
-    """Manually trigger Gmail synchronization for authenticated user's account."""
-    role = (x_user_role or "student").strip().lower()
-    account = get_google_account(email=x_user_email, role=role)
+    """Manually trigger Gmail synchronization for authenticated user's account.
+
+    Strictly prevents teachers from accessing or syncing private student Gmail inboxes.
+    """
+    role = (current_user.get("role") if current_user else None) or (x_user_role or "student").strip().lower()
+    if role == "teacher":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access forbidden: Teachers cannot access or trigger sync for private student Gmail inboxes.",
+        )
+    email = (current_user.get("email") if current_user else None) or x_user_email
+    account = get_google_account(email=email, role=role)
     if not account:
         account = get_google_account()
 
@@ -1401,7 +1564,10 @@ def get_classroom_submissions(
     x_user_role: Optional[str] = Header(None, alias="X-User-Role"),
     x_user_email: Optional[str] = Header(None, alias="X-User-Email"),
 ) -> list[dict[str, Any]]:
-    """List student coursework submissions. Students only see their own submissions."""
+    """List student coursework submissions.
+
+    Students only see their own submissions. Teachers only see submissions for their authorized courses.
+    """
     role = (current_user.get("role") if current_user else None) or (x_user_role or "student").strip().lower()
     email = (current_user.get("email") if current_user else None) or x_user_email
     acc = get_google_account(email=email)
@@ -1409,11 +1575,78 @@ def get_classroom_submissions(
 
     # If student, strictly isolate submissions to student's own ID
     student_filter = student_id if role == "student" else None
+    teacher_filter = email if role == "teacher" else None
+
     return list_classroom_submissions(
         course_id=course_id,
         student_id=student_filter,
+        teacher_email=teacher_filter,
         include_demo=include_demo,
     )
+
+
+@app.post("/api/classroom/submissions/turn-in")
+def turn_in_submission(
+    payload: TurnInSubmissionRequest,
+    current_user: Optional[dict[str, Any]] = Depends(get_current_user_optional),
+    x_user_role: Optional[str] = Header(None, alias="X-User-Role"),
+    x_user_email: Optional[str] = Header(None, alias="X-User-Email"),
+) -> dict[str, Any]:
+    """Turn in a student coursework assignment submission."""
+    role = (current_user.get("role") if current_user else None) or (x_user_role or "student").strip().lower()
+    if role != "student":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access forbidden: Only students can turn in coursework submissions.",
+        )
+    email = (current_user.get("email") if current_user else None) or x_user_email
+    acc = get_google_account(email=email)
+    student_id = email or (acc.get("email") if acc else "student.demo@univ.edu")
+    student_name = current_user.get("name") if current_user else None
+
+    try:
+        res = turn_in_classroom_submission(
+            coursework_id=payload.coursework_id,
+            student_id=student_id,
+            student_name=student_name,
+            alternate_link=payload.alternate_link,
+        )
+        return res
+    except ValueError as err:
+        raise HTTPException(status_code=400, detail=str(err))
+
+
+@app.patch("/api/classroom/submissions/{submission_id}/grade")
+def grade_submission(
+    submission_id: str,
+    payload: GradeSubmissionRequest,
+    current_user: Optional[dict[str, Any]] = Depends(get_current_user_optional),
+    x_user_role: Optional[str] = Header(None, alias="X-User-Role"),
+    x_user_email: Optional[str] = Header(None, alias="X-User-Email"),
+) -> dict[str, Any]:
+    """Grade a student submission and return it to the student.
+
+    Verifies that the teacher is authorized to grade submissions for the associated course.
+    """
+    role = (current_user.get("role") if current_user else None) or (x_user_role or "").strip().lower()
+    if role != "teacher":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access forbidden: Teacher role is required to grade submissions.",
+        )
+    email = (current_user.get("email") if current_user else None) or x_user_email
+
+    try:
+        graded = grade_classroom_submission(
+            submission_id=submission_id,
+            assigned_grade=payload.assigned_grade,
+            teacher_email=email,
+        )
+        return graded
+    except PermissionError as err:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(err))
+    except ValueError as err:
+        raise HTTPException(status_code=400, detail=str(err))
 
 
 @app.get("/api/teacher/coursework-overview")
@@ -1455,3 +1688,1275 @@ def create_study_material(payload: StudyMaterialCreateRequest) -> dict[str, Any]
         return saved
     except ValueError as err:
         raise HTTPException(status_code=400, detail=str(err))
+
+
+# ==============================================================================
+# SMART 3.0: Collaboration Models & Real-Time WebSocket Infrastructure
+# ==============================================================================
+
+
+class CreateCourseRequest(BaseModel):
+    code: str
+    name: Optional[str] = None
+    title: Optional[str] = None
+    section: Optional[str] = None
+    description: Optional[str] = None
+    theme_color: Optional[str] = None
+
+
+class UpdateCourseRequest(BaseModel):
+    name: Optional[str] = None
+    title: Optional[str] = None
+    section: Optional[str] = None
+    description: Optional[str] = None
+    is_active: Optional[int] = None
+
+
+class JoinCourseRequest(BaseModel):
+    join_code: str
+
+
+class InviteStudentRequest(BaseModel):
+    student_email: Optional[str] = None
+    email: Optional[str] = None
+
+
+class SendMessageRequest(BaseModel):
+    content: str = ""
+    recipient_id: Optional[int] = None
+    attachment_url: Optional[str] = None
+    attachment_name: Optional[str] = None
+
+
+class MarkMessagesReadRequest(BaseModel):
+    message_ids: Optional[list[int]] = None
+
+
+class CreateAnnouncementRequest(BaseModel):
+    title: str
+    content: str
+    target_student_ids: Optional[list[int]] = None
+    attachment_urls: Optional[list[dict[str, str]]] = None
+    is_pinned: bool = False
+
+
+class CreatePollRequest(BaseModel):
+    question: str
+    options: list[str] = []
+    poll_type: str = "multiple_choice"
+    is_anonymous: bool = False
+    results_visible_before_close: bool = True
+    closes_at: Optional[str] = None
+
+
+class SubmitVoteRequest(BaseModel):
+    option_id: Optional[int] = None
+    feedback_text: Optional[str] = None
+    short_feedback: Optional[str] = None
+
+
+class ConnectionManager:
+    """Manages active course WebSocket rooms and message broadcasting."""
+
+    def __init__(self):
+        self.active_rooms: dict[int, list[WebSocket]] = {}
+
+    async def connect(self, course_id: int, websocket: WebSocket):
+        await websocket.accept()
+        if course_id not in self.active_rooms:
+            self.active_rooms[course_id] = []
+        self.active_rooms[course_id].append(websocket)
+
+    def disconnect(self, course_id: int, websocket: WebSocket):
+        if course_id in self.active_rooms:
+            if websocket in self.active_rooms[course_id]:
+                self.active_rooms[course_id].remove(websocket)
+            if not self.active_rooms[course_id]:
+                del self.active_rooms[course_id]
+
+    async def broadcast(self, course_id: int, message: dict[str, Any]):
+        if course_id in self.active_rooms:
+            dead_sockets = []
+            for connection in list(self.active_rooms[course_id]):
+                try:
+                    await connection.send_json(message)
+                except Exception:
+                    dead_sockets.append(connection)
+            for dead in dead_sockets:
+                self.disconnect(course_id, dead)
+
+
+ws_manager = ConnectionManager()
+
+
+@app.websocket("/ws/courses/{course_id}/messages")
+async def websocket_course_chat(
+    websocket: WebSocket,
+    course_id: int,
+    session_id: Optional[str] = Query(None),
+):
+    """Real-time authenticated course chat WebSocket endpoint."""
+    smart_session = websocket.cookies.get(SESSION_COOKIE_NAME) or session_id
+    user = None
+    if smart_session:
+        user = get_session_with_user(smart_session)
+
+    if not user and not IS_PRODUCTION:
+        x_email = websocket.headers.get("x-user-email")
+        if x_email:
+            user = get_user_by_email(x_email)
+
+    if not user:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
+    user_id = user["id"]
+    if not is_user_enrolled(course_id, user_id):
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
+    await ws_manager.connect(course_id, websocket)
+    try:
+        while True:
+            data = await websocket.receive_json()
+            content = data.get("content", "")
+            recipient_id = data.get("recipient_id")
+            attachment_url = data.get("attachment_url")
+            attachment_name = data.get("attachment_name")
+
+            if content or attachment_url:
+                saved = save_course_message(
+                    course_id=course_id,
+                    sender_id=user_id,
+                    content=content,
+                    recipient_id=recipient_id,
+                    attachment_url=attachment_url,
+                    attachment_name=attachment_name,
+                )
+                await ws_manager.broadcast(course_id, {
+                    "type": "new_message",
+                    "message": saved,
+                })
+    except WebSocketDisconnect:
+        ws_manager.disconnect(course_id, websocket)
+    except Exception:
+        ws_manager.disconnect(course_id, websocket)
+
+
+# ==============================================================================
+# SMART 3.0: Course & Student Management REST APIs
+# ==============================================================================
+
+
+@app.post("/api/courses", status_code=status.HTTP_201_CREATED)
+def create_course_endpoint(
+    payload: CreateCourseRequest,
+    current_user: dict[str, Any] = Depends(require_role("teacher")),
+) -> dict[str, Any]:
+    """Create a new SMART course with unique enrollment join code (Teacher only)."""
+    try:
+        course_name = (payload.name or payload.title or "").strip()
+        if not course_name:
+            raise HTTPException(status_code=400, detail="Course name/title cannot be empty.")
+        course = create_smart_course(
+            teacher_id=current_user["id"],
+            code=payload.code,
+            name=course_name,
+            section=payload.section,
+            description=payload.description,
+        )
+        if "name" in course and "title" not in course:
+            course["title"] = course["name"]
+        return course
+    except ValueError as err:
+        raise HTTPException(status_code=400, detail=str(err))
+
+
+@app.get("/api/courses")
+def list_courses_endpoint(
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> list[dict[str, Any]]:
+    """List all SMART courses accessible to the authenticated student or teacher."""
+    role = current_user.get("role", "student")
+    user_id = current_user["id"]
+    courses = list_user_smart_courses(user_id=user_id, role=role)
+    for c in courses:
+        if "name" in c and "title" not in c:
+            c["title"] = c["name"]
+        if "student_count" in c and "enrolled_count" not in c:
+            c["enrolled_count"] = c["student_count"]
+    return courses
+
+
+@app.get("/api/courses/{course_id}")
+def get_course_endpoint(
+    course_id: int,
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Get single course details with membership verification."""
+    course = get_smart_course(course_id)
+    if not course:
+        raise HTTPException(status_code=404, detail=f"Course {course_id} not found.")
+
+    user_id = current_user["id"]
+    if not is_user_enrolled(course_id, user_id):
+        raise HTTPException(status_code=403, detail="Access denied: You are not enrolled in this course.")
+
+    return course
+
+
+@app.put("/api/courses/{course_id}")
+def update_course_endpoint(
+    course_id: int,
+    payload: UpdateCourseRequest,
+    current_user: dict[str, Any] = Depends(require_role("teacher")),
+) -> dict[str, Any]:
+    """Update course metadata (Teacher only)."""
+    try:
+        updated = update_smart_course(
+            course_id=course_id,
+            updates=payload.model_dump(exclude_unset=True),
+            teacher_id=current_user["id"],
+        )
+        if not updated:
+            raise HTTPException(status_code=404, detail=f"Course {course_id} not found.")
+        return updated
+    except PermissionError as err:
+        raise HTTPException(status_code=403, detail=str(err))
+    except ValueError as err:
+        raise HTTPException(status_code=400, detail=str(err))
+
+
+@app.post("/api/courses/{course_id}/regenerate-code")
+def regenerate_join_code_endpoint(
+    course_id: int,
+    current_user: dict[str, Any] = Depends(require_role("teacher")),
+) -> dict[str, Any]:
+    """Regenerate a course's student enrollment join code (Teacher only)."""
+    try:
+        return regenerate_course_join_code(course_id=course_id, teacher_id=current_user["id"])
+    except PermissionError as err:
+        raise HTTPException(status_code=403, detail=str(err))
+    except ValueError as err:
+        raise HTTPException(status_code=400, detail=str(err))
+
+
+@app.post("/api/courses/join")
+def join_course_endpoint(
+    payload: JoinCourseRequest,
+    current_user: dict[str, Any] = Depends(require_role("student")),
+) -> dict[str, Any]:
+    """Enroll a student into a course using a valid join code."""
+    try:
+        enrolled = enroll_student_by_join_code(
+            user_id=current_user["id"],
+            join_code=payload.join_code,
+        )
+        return enrolled
+    except ValueError as err:
+        raise HTTPException(status_code=400, detail=str(err))
+
+
+@app.get("/api/courses/{course_id}/members")
+def list_course_members_endpoint(
+    course_id: int,
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> list[dict[str, Any]]:
+    """List all enrolled students and instructors in a course."""
+    if not is_user_enrolled(course_id, current_user["id"]):
+        raise HTTPException(status_code=403, detail="Access denied: You are not enrolled in this course.")
+    return list_course_members(course_id)
+
+
+@app.delete("/api/courses/{course_id}/members/{target_user_id}")
+def remove_course_member_endpoint(
+    course_id: int,
+    target_user_id: int,
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Remove student from course (Teacher removing student or Student dropping self)."""
+    try:
+        success = remove_student_from_course(
+            course_id=course_id,
+            user_id=target_user_id,
+            requester_id=current_user["id"],
+            requester_role=current_user.get("role", "student"),
+        )
+        if not success:
+            raise HTTPException(status_code=404, detail="Membership not found.")
+        return {"status": "success", "course_id": course_id, "user_id": target_user_id}
+    except PermissionError as err:
+        raise HTTPException(status_code=403, detail=str(err))
+    except ValueError as err:
+        raise HTTPException(status_code=400, detail=str(err))
+
+
+@app.post("/api/courses/{course_id}/invitations")
+def invite_student_endpoint(
+    course_id: int,
+    payload: InviteStudentRequest,
+    current_user: dict[str, Any] = Depends(require_role("teacher")),
+) -> dict[str, Any]:
+    """Invite a student by email address to join a course (Teacher only)."""
+    try:
+        target_email = (payload.student_email or payload.email or "").strip().lower()
+        if not target_email:
+            raise HTTPException(status_code=400, detail="Student email cannot be empty.")
+        inv = create_course_invitation(
+            course_id=course_id,
+            inviter_id=current_user["id"],
+            student_email=target_email,
+        )
+        return inv
+    except PermissionError as err:
+        raise HTTPException(status_code=403, detail=str(err))
+    except ValueError as err:
+        raise HTTPException(status_code=400, detail=str(err))
+
+
+@app.get("/api/courses/{course_id}/invitations")
+def list_course_invitations_endpoint(
+    course_id: int,
+    current_user: dict[str, Any] = Depends(require_role("teacher")),
+) -> list[dict[str, Any]]:
+    """List pending invitations issued for a course (Teacher only)."""
+    return list_course_invitations(course_id)
+
+
+@app.get("/api/invitations")
+@app.get("/api/student/invitations")
+def list_student_invitations_endpoint(
+    current_user: dict[str, Any] = Depends(require_role("student")),
+) -> list[dict[str, Any]]:
+    """List pending course invitations issued to the logged-in student."""
+    return list_student_pending_invitations(current_user["email"])
+
+
+@app.post("/api/invitations/{invitation_id}/accept")
+@app.post("/api/student/invitations/{invitation_id}/accept")
+def accept_invitation_endpoint(
+    invitation_id: int,
+    current_user: dict[str, Any] = Depends(require_role("student")),
+) -> dict[str, Any]:
+    """Accept a pending course invitation."""
+    try:
+        return accept_course_invitation(
+            invitation_id=invitation_id,
+            student_user_id=current_user["id"],
+            student_email=current_user["email"],
+        )
+    except PermissionError as err:
+        raise HTTPException(status_code=403, detail=str(err))
+    except ValueError as err:
+        raise HTTPException(status_code=400, detail=str(err))
+
+
+# ==============================================================================
+# SMART 3.0: Communication & Messages REST APIs
+# ==============================================================================
+
+
+@app.get("/api/courses/{course_id}/messages")
+def list_messages_endpoint(
+    course_id: int,
+    recipient_id: Optional[int] = Query(None),
+    limit: int = Query(50, ge=1, le=200),
+    before_id: Optional[int] = Query(None),
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> list[dict[str, Any]]:
+    """Retrieve message history for a course or direct message thread."""
+    try:
+        return list_course_messages(
+            course_id=course_id,
+            user_id=current_user["id"],
+            recipient_id=recipient_id,
+            limit=limit,
+            before_id=before_id,
+        )
+    except PermissionError as err:
+        raise HTTPException(status_code=403, detail=str(err))
+
+
+@app.post("/api/courses/{course_id}/messages", status_code=status.HTTP_201_CREATED)
+async def send_message_endpoint(
+    course_id: int,
+    payload: SendMessageRequest,
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Send a message via REST and broadcast to active WebSocket clients."""
+    try:
+        saved = save_course_message(
+            course_id=course_id,
+            sender_id=current_user["id"],
+            content=payload.content,
+            recipient_id=payload.recipient_id,
+            attachment_url=payload.attachment_url,
+            attachment_name=payload.attachment_name,
+        )
+        await ws_manager.broadcast(course_id, {
+            "type": "new_message",
+            "message": saved,
+        })
+        return saved
+    except PermissionError as err:
+        raise HTTPException(status_code=403, detail=str(err))
+    except ValueError as err:
+        raise HTTPException(status_code=400, detail=str(err))
+
+
+@app.post("/api/courses/{course_id}/messages/read")
+def mark_messages_read_endpoint(
+    course_id: int,
+    payload: MarkMessagesReadRequest = MarkMessagesReadRequest(),
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Mark messages as read."""
+    count = mark_messages_read(
+        course_id=course_id,
+        user_id=current_user["id"],
+        message_ids=payload.message_ids,
+    )
+    return {"status": "success", "marked_read": count}
+
+
+@app.get("/api/messages/unread-count")
+def get_unread_messages_endpoint(
+    course_id: Optional[int] = Query(None),
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, int]:
+    """Get count of unread messages."""
+    user_id = current_user.get("id") or current_user.get("user_id")
+    if not user_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Valid authenticated user profile required.",
+        )
+    cnt = get_unread_message_count(user_id=user_id, course_id=course_id)
+    return {"unread_count": cnt}
+
+
+# ==============================================================================
+# SMART 3.0: Course Announcements REST APIs
+# ==============================================================================
+
+
+@app.post("/api/courses/{course_id}/announcements", status_code=status.HTTP_201_CREATED)
+def create_announcement_endpoint(
+    course_id: int,
+    payload: CreateAnnouncementRequest,
+    current_user: dict[str, Any] = Depends(require_role("teacher")),
+) -> dict[str, Any]:
+    """Broadcast an official announcement to course students (Teacher only)."""
+    try:
+        ann = create_course_announcement(
+            course_id=course_id,
+            teacher_id=current_user["id"],
+            title=payload.title,
+            content=payload.content,
+            target_student_ids=payload.target_student_ids,
+            attachment_urls=payload.attachment_urls,
+            is_pinned=payload.is_pinned,
+        )
+        return ann
+    except PermissionError as err:
+        raise HTTPException(status_code=403, detail=str(err))
+    except ValueError as err:
+        raise HTTPException(status_code=400, detail=str(err))
+
+
+@app.get("/api/courses/{course_id}/announcements")
+def list_announcements_endpoint(
+    course_id: int,
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> list[dict[str, Any]]:
+    """List announcements for a course with user-specific read indicators."""
+    if not is_user_enrolled(course_id, current_user["id"]):
+        raise HTTPException(status_code=403, detail="Access denied: You are not enrolled in this course.")
+    return list_course_announcements(course_id=course_id, user_id=current_user["id"])
+
+
+@app.post("/api/announcements/{announcement_id}/acknowledge")
+@app.post("/api/courses/{course_id}/announcements/{announcement_id}/acknowledge")
+def acknowledge_announcement_endpoint(
+    announcement_id: int,
+    course_id: Optional[int] = None,
+    current_user: dict[str, Any] = Depends(require_role("student")),
+) -> dict[str, Any]:
+    """Acknowledge / mark as read an announcement."""
+    try:
+        return acknowledge_announcement(announcement_id=announcement_id, student_id=current_user["id"])
+    except ValueError as err:
+        raise HTTPException(status_code=404, detail=str(err))
+
+
+# ==============================================================================
+# SMART 3.0: Interactive Polls REST APIs
+# ==============================================================================
+
+
+@app.post("/api/courses/{course_id}/polls", status_code=status.HTTP_201_CREATED)
+def create_poll_endpoint(
+    course_id: int,
+    payload: CreatePollRequest,
+    current_user: dict[str, Any] = Depends(require_role("teacher")),
+) -> dict[str, Any]:
+    """Create a structured course poll (Teacher only)."""
+    try:
+        poll = create_course_poll(
+            course_id=course_id,
+            creator_id=current_user["id"],
+            question=payload.question,
+            options=payload.options,
+            poll_type=payload.poll_type,
+            is_anonymous=payload.is_anonymous,
+            results_visible_before_close=payload.results_visible_before_close,
+            closes_at=payload.closes_at,
+        )
+        return poll
+    except PermissionError as err:
+        raise HTTPException(status_code=403, detail=str(err))
+    except ValueError as err:
+        raise HTTPException(status_code=400, detail=str(err))
+
+
+@app.get("/api/courses/{course_id}/polls")
+def list_polls_endpoint(
+    course_id: int,
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> list[dict[str, Any]]:
+    """List all polls for a course with vote distributions and user's vote."""
+    if not is_user_enrolled(course_id, current_user["id"]):
+        raise HTTPException(status_code=403, detail="Access denied: You are not enrolled in this course.")
+    return list_course_polls(course_id=course_id, user_id=current_user["id"])
+
+
+@app.get("/api/polls/{poll_id}")
+def get_poll_endpoint(
+    poll_id: int,
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Retrieve single poll details."""
+    poll = get_poll_details(poll_id=poll_id, user_id=current_user["id"])
+    if not poll:
+        raise HTTPException(status_code=404, detail=f"Poll {poll_id} not found.")
+    return poll
+
+
+@app.post("/api/polls/{poll_id}/vote")
+@app.post("/api/courses/{course_id}/polls/{poll_id}/vote")
+def submit_poll_vote_endpoint(
+    poll_id: int,
+    payload: SubmitVoteRequest,
+    course_id: Optional[int] = None,
+    current_user: dict[str, Any] = Depends(require_role("student")),
+) -> dict[str, Any]:
+    """Submit a vote or feedback in a course poll."""
+    try:
+        feedback = payload.feedback_text or payload.short_feedback
+        updated_poll = submit_poll_vote(
+            poll_id=poll_id,
+            user_id=current_user["id"],
+            option_id=payload.option_id,
+            feedback_text=feedback,
+        )
+        return updated_poll
+    except PermissionError as err:
+        raise HTTPException(status_code=403, detail=str(err))
+    except ValueError as err:
+        raise HTTPException(status_code=400, detail=str(err))
+
+
+@app.post("/api/polls/{poll_id}/close")
+@app.post("/api/courses/{course_id}/polls/{poll_id}/close")
+def close_poll_endpoint(
+    poll_id: int,
+    course_id: Optional[int] = None,
+    current_user: dict[str, Any] = Depends(require_role("teacher")),
+) -> dict[str, Any]:
+    """Close an active poll early (Teacher only)."""
+    try:
+        return close_course_poll(poll_id=poll_id, teacher_id=current_user["id"])
+    except PermissionError as err:
+        raise HTTPException(status_code=403, detail=str(err))
+    except ValueError as err:
+        raise HTTPException(status_code=404, detail=str(err))
+
+
+# ==============================================================================
+# SMART 3.0: Unified Notifications REST APIs
+# ==============================================================================
+
+
+@app.get("/api/notifications")
+def list_notifications_endpoint(
+    course_id: Optional[int] = Query(None),
+    unread_only: bool = Query(False),
+    limit: int = Query(50, ge=1, le=100),
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> list[dict[str, Any]]:
+    """List persistent notifications for the authenticated user."""
+    return list_user_notifications(
+        user_id=current_user["id"],
+        course_id=course_id,
+        unread_only=unread_only,
+        limit=limit,
+    )
+
+
+@app.post("/api/notifications/{notification_id}/read")
+def mark_notification_read_endpoint(
+    notification_id: int,
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Mark a notification as read."""
+    success = mark_notification_read(notification_id=notification_id, user_id=current_user["id"])
+    if not success:
+        raise HTTPException(status_code=404, detail="Notification not found.")
+    return {"status": "success", "id": notification_id}
+
+
+@app.post("/api/notifications/read-all")
+def mark_all_notifications_read_endpoint(
+    course_id: Optional[int] = Query(None),
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Mark all notifications as read."""
+    count = mark_all_notifications_read(user_id=current_user["id"], course_id=course_id)
+    return {"status": "success", "marked_read": count}
+
+
+@app.get("/api/notifications/unread-count")
+def get_unread_notifications_count_endpoint(
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, int]:
+    """Get count of unread notifications for the authenticated user."""
+    user_id = current_user.get("id") or current_user.get("user_id")
+    if not user_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Valid authenticated user profile required.",
+        )
+    cnt = get_unread_notification_count(user_id=user_id)
+    return {"unread_count": cnt}
+
+
+# ==============================================================================
+# SMART 3.0: Engagement Analytics REST APIs
+# ==============================================================================
+
+
+@app.get("/api/courses/{course_id}/analytics")
+def get_course_analytics_endpoint(
+    course_id: int,
+    current_user: dict[str, Any] = Depends(require_role("teacher")),
+) -> dict[str, Any]:
+    """Compute real-time data-driven course engagement analytics (Teacher only)."""
+    try:
+        analytics = get_course_engagement_analytics(
+            course_id=course_id,
+            teacher_id=current_user["id"],
+        )
+        return analytics
+    except PermissionError as err:
+        raise HTTPException(status_code=403, detail=str(err))
+    except ValueError as err:
+        raise HTTPException(status_code=404, detail=str(err))
+
+
+@app.get("/api/student/analytics")
+def get_student_analytics_endpoint(
+    current_user: dict[str, Any] = Depends(require_role("student")),
+) -> dict[str, Any]:
+    """Retrieve personal engagement and completion progress for the student."""
+    return get_student_personal_analytics(student_id=current_user["id"])
+
+
+# ==============================================================================
+# SMART 3.1: Native Teacher Study Materials & Resource Management
+# ==============================================================================
+
+MAX_UPLOAD_SIZE_MB = int(os.environ.get("MAX_UPLOAD_SIZE_MB", "25"))
+MAX_UPLOAD_SIZE_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024
+UPLOAD_BASE_DIR = Path(__file__).resolve().parent / "uploads" / "course_materials"
+UPLOAD_BASE_DIR.mkdir(parents=True, exist_ok=True)
+
+ALLOWED_EXTENSIONS_MAP: dict[str, str] = {
+    ".pdf": "application/pdf",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".doc": "application/msword",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".ppt": "application/vnd.ms-powerpoint",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".xls": "application/vnd.ms-excel",
+    ".txt": "text/plain",
+}
+
+BLOCKED_DANGEROUS_EXTENSIONS: set[str] = {
+    ".exe", ".bat", ".cmd", ".sh", ".py", ".js", ".mjs", ".html", ".htm",
+    ".php", ".vbs", ".ps1", ".jar", ".msi", ".dll", ".com", ".scr", ".svg",
+    ".bin", ".elf", ".apk", ".app", ".dmg", ".iso"
+}
+
+
+def validate_file_content_and_signature(filename: str, initial_chunk: bytes, total_size: int) -> tuple[str, str]:
+    """Verify file size, extension safety, and header magic bytes.
+    
+    Returns (clean_lowercase_extension, canonical_mime_type).
+    """
+    if total_size > MAX_UPLOAD_SIZE_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"File exceeds maximum allowed size of {MAX_UPLOAD_SIZE_MB} MB.",
+        )
+
+    _, ext = os.path.splitext(filename or "")
+    ext = ext.lower().strip()
+
+    if ext in BLOCKED_DANGEROUS_EXTENSIONS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Security alert: Prohibited executable or script file extension '{ext}'.",
+        )
+
+    if ext not in ALLOWED_EXTENSIONS_MAP:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported file format '{ext}'. Allowed: PDF, DOCX, DOC, PPTX, PPT, XLSX, XLS, TXT.",
+        )
+
+    canonical_mime = ALLOWED_EXTENSIONS_MAP[ext]
+
+    # Validate file magic bytes
+    if ext == ".pdf":
+        if b"%PDF-" not in initial_chunk[:1024]:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid file: Header does not match genuine PDF structure.",
+            )
+    elif ext in (".docx", ".pptx", ".xlsx"):
+        if not initial_chunk.startswith(b"PK\x03\x04"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid file: Header does not match valid {ext[1:].upper()} OpenXML archive structure.",
+            )
+    elif ext in (".doc", ".ppt", ".xls"):
+        if not initial_chunk.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid file: Header does not match valid Microsoft Compound Document format.",
+            )
+    elif ext == ".txt":
+        if b"\x00" in initial_chunk[:1024]:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid file: Plain text file contains binary null bytes.",
+            )
+        try:
+            initial_chunk.decode("utf-8")
+        except UnicodeDecodeError:
+            try:
+                initial_chunk.decode("latin-1")
+            except Exception:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Invalid file: Text content cannot be decoded.",
+                )
+
+    return ext, canonical_mime
+
+
+class CourseMaterialUpdatePayload(BaseModel):
+    title: Optional[str] = Field(None, min_length=1, max_length=255)
+    description: Optional[str] = None
+    category: Optional[str] = None
+
+
+@app.post("/api/courses/{course_id}/materials", status_code=status.HTTP_201_CREATED)
+async def upload_course_material_endpoint(
+    course_id: int,
+    file: UploadFile = File(...),
+    title: str = Form(...),
+    description: Optional[str] = Form(None),
+    category: str = Form("Study Materials"),
+    current_user: dict[str, Any] = Depends(require_role("teacher")),
+) -> dict[str, Any]:
+    """Upload and publish a course study material (Teacher only)."""
+    course = get_smart_course(course_id)
+    if not course:
+        raise HTTPException(status_code=404, detail="Course not found.")
+
+    if not is_user_course_teacher(course_id, current_user["id"]):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the course instructor can upload study materials.",
+        )
+
+    clean_title = (title or "").strip()
+    if not clean_title:
+        clean_title = os.path.splitext(file.filename or "Untitled Resource")[0]
+
+    initial_chunk = await file.read(4096)
+    if not initial_chunk:
+        raise HTTPException(status_code=400, detail="Cannot upload an empty file.")
+
+    chunks = [initial_chunk]
+    total_size = len(initial_chunk)
+
+    while True:
+        chunk = await file.read(64 * 1024)
+        if not chunk:
+            break
+        total_size += len(chunk)
+        if total_size > MAX_UPLOAD_SIZE_BYTES:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=f"File exceeds maximum allowed size of {MAX_UPLOAD_SIZE_MB} MB.",
+            )
+        chunks.append(chunk)
+
+    clean_ext, detected_mime = validate_file_content_and_signature(
+        file.filename or "",
+        initial_chunk,
+        total_size,
+    )
+
+    # Secure course upload folder
+    course_dir = (UPLOAD_BASE_DIR / str(course_id)).resolve()
+    course_dir.mkdir(parents=True, exist_ok=True)
+
+    stored_filename = f"{uuid.uuid4().hex}{clean_ext}"
+    target_path = (course_dir / stored_filename).resolve()
+
+    if not target_path.is_relative_to(course_dir):
+        raise HTTPException(status_code=400, detail="Path traversal attempt detected.")
+
+    with open(target_path, "wb") as f:
+        for c in chunks:
+            f.write(c)
+
+    # Persist in DB
+    clean_cat = category.strip() if category and category.strip() in VALID_MATERIAL_CATEGORIES else "Study Materials"
+    material = save_course_material(
+        course_id=course_id,
+        uploaded_by=current_user["id"],
+        title=clean_title,
+        description=description,
+        original_filename=file.filename or f"material{clean_ext}",
+        stored_filename=stored_filename,
+        storage_path=str(target_path),
+        file_extension=clean_ext,
+        mime_type=detected_mime,
+        file_size=total_size,
+        category=clean_cat,
+    )
+
+    # Broadcast notification to enrolled students
+    student_ids = get_course_enrolled_student_ids(course_id)
+    instructor_name = current_user.get("name") or "Instructor"
+    for sid in student_ids:
+        try:
+            create_notification(
+                user_id=sid,
+                course_id=course_id,
+                title=f"[{course['name']}] New {clean_cat}: {clean_title}",
+                message=f"Prof. {instructor_name} uploaded '{clean_title}'.",
+                notification_type="announcement",
+                reference_id=f"/materials?course={course_id}&material={material['id']}",
+            )
+        except Exception:
+            pass
+
+    return {
+        "id": material["id"],
+        "course_id": material["course_id"],
+        "uploaded_by": material["uploaded_by"],
+        "title": material["title"],
+        "description": material["description"],
+        "original_filename": material["original_filename"],
+        "file_extension": material["file_extension"],
+        "mime_type": material["mime_type"],
+        "file_size": material["file_size"],
+        "category": material["category"],
+        "created_at": material["created_at"],
+        "updated_at": material["updated_at"],
+        "uploader_name": material["uploader_name"],
+        "uploader_role": material["uploader_role"],
+        "course_name": material["course_name"],
+        "course_code": material["course_code"],
+    }
+
+
+@app.get("/api/courses/{course_id}/materials")
+def list_course_materials_endpoint(
+    course_id: int,
+    category: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> list[dict[str, Any]]:
+    """List study materials for a course (Enrolled students and instructors)."""
+    course = get_smart_course(course_id)
+    if not course:
+        raise HTTPException(status_code=404, detail="Course not found.")
+
+    if not is_user_enrolled(course_id, current_user["id"]):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You must be enrolled in this course to view its study materials.",
+        )
+
+    return list_course_materials(course_id=course_id, category=category, search=search)
+
+
+@app.get("/api/materials/{material_id}")
+def get_material_metadata_endpoint(
+    material_id: int,
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Retrieve metadata for a specific study material (Authorized course members)."""
+    material = get_course_material(material_id)
+    if not material:
+        raise HTTPException(status_code=404, detail="Study material not found.")
+
+    if not is_user_enrolled(material["course_id"], current_user["id"]):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You must be enrolled in the course to view this study material.",
+        )
+
+    return {
+        "id": material["id"],
+        "course_id": material["course_id"],
+        "uploaded_by": material["uploaded_by"],
+        "title": material["title"],
+        "description": material["description"],
+        "original_filename": material["original_filename"],
+        "file_extension": material["file_extension"],
+        "mime_type": material["mime_type"],
+        "file_size": material["file_size"],
+        "category": material["category"],
+        "created_at": material["created_at"],
+        "updated_at": material["updated_at"],
+        "uploader_name": material["uploader_name"],
+        "uploader_role": material["uploader_role"],
+        "course_name": material["course_name"],
+        "course_code": material["course_code"],
+    }
+
+
+@app.get("/api/materials/{material_id}/download")
+def download_course_material_endpoint(
+    material_id: int,
+    current_user: dict[str, Any] = Depends(get_current_user),
+):
+    """Download the original uploaded study material file."""
+    material = get_course_material(material_id)
+    if not material:
+        raise HTTPException(status_code=404, detail="Study material not found.")
+
+    if not is_user_enrolled(material["course_id"], current_user["id"]):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You must be enrolled in the course to download this study material.",
+        )
+
+    file_path = Path(material["storage_path"]).resolve()
+    if not file_path.is_file():
+        raise HTTPException(status_code=404, detail="Physical material file not found on server.")
+
+    encoded_filename = urllib.parse.quote(material["original_filename"])
+    return FileResponse(
+        path=str(file_path),
+        media_type=material.get("mime_type", "application/octet-stream"),
+        filename=material["original_filename"],
+        headers={
+            "Content-Disposition": f'attachment; filename="{encoded_filename}"; filename*=UTF-8\'\'{encoded_filename}'
+        },
+    )
+
+
+@app.get("/api/materials/{material_id}/preview")
+def preview_course_material_endpoint(
+    material_id: int,
+    current_user: dict[str, Any] = Depends(get_current_user),
+):
+    """Preview supported documents (PDF, plain text) inline in browser/SMART UI."""
+    material = get_course_material(material_id)
+    if not material:
+        raise HTTPException(status_code=404, detail="Study material not found.")
+
+    if not is_user_enrolled(material["course_id"], current_user["id"]):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You must be enrolled in the course to preview this study material.",
+        )
+
+    file_path = Path(material["storage_path"]).resolve()
+    if not file_path.is_file():
+        raise HTTPException(status_code=404, detail="Physical material file not found on server.")
+
+    ext = material["file_extension"].lower()
+    encoded_filename = urllib.parse.quote(material["original_filename"])
+
+    if ext in (".pdf", ".txt"):
+        return FileResponse(
+            path=str(file_path),
+            media_type=material["mime_type"],
+            headers={
+                "Content-Disposition": f'inline; filename="{encoded_filename}"; filename*=UTF-8\'\'{encoded_filename}'
+            },
+        )
+    else:
+        return FileResponse(
+            path=str(file_path),
+            media_type=material["mime_type"],
+            filename=material["original_filename"],
+            headers={
+                "Content-Disposition": f'attachment; filename="{encoded_filename}"; filename*=UTF-8\'\'{encoded_filename}'
+            },
+        )
+
+
+@app.patch("/api/materials/{material_id}")
+def update_course_material_endpoint(
+    material_id: int,
+    payload: CourseMaterialUpdatePayload,
+    current_user: dict[str, Any] = Depends(require_role("teacher")),
+) -> dict[str, Any]:
+    """Update title, description, or category for a study material (Instructor only)."""
+    material = get_course_material(material_id)
+    if not material:
+        raise HTTPException(status_code=404, detail="Study material not found.")
+
+    if not is_user_course_teacher(material["course_id"], current_user["id"]):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the course instructor can modify study materials.",
+        )
+
+    updates = {k: v for k, v in payload.model_dump().items() if v is not None}
+    if not updates:
+        return material
+
+    updated = update_course_material(
+        material_id=material_id,
+        updates=updates,
+        teacher_id=current_user["id"],
+    )
+    if not updated:
+        raise HTTPException(status_code=404, detail="Could not update study material.")
+
+    return updated
+
+
+@app.delete("/api/materials/{material_id}")
+def delete_course_material_endpoint(
+    material_id: int,
+    current_user: dict[str, Any] = Depends(require_role("teacher")),
+) -> dict[str, Any]:
+    """Delete study material record and securely delete the stored file from disk (Instructor only)."""
+    material = get_course_material(material_id)
+    if not material:
+        raise HTTPException(status_code=404, detail="Study material not found.")
+
+    if not is_user_course_teacher(material["course_id"], current_user["id"]):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the course instructor can delete study materials.",
+        )
+
+    deleted_rec = delete_course_material(
+        material_id=material_id,
+        teacher_id=current_user["id"],
+    )
+    if not deleted_rec:
+        raise HTTPException(status_code=404, detail="Material could not be deleted.")
+
+    try:
+        fpath = Path(deleted_rec["storage_path"]).resolve()
+        if fpath.is_file():
+            fpath.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    return {"status": "deleted", "id": material_id}
+
+
+# ==============================================================================
+# SMART 3.2: Student Competitions & Opportunities Tracking with Faculty Analytics
+# ==============================================================================
+
+
+class TrackOpportunityPayload(BaseModel):
+    title: str = Field(..., min_length=1, max_length=255)
+    organizer: Optional[str] = None
+    category: str = Field("Competition")
+    description: Optional[str] = None
+    registration_url: Optional[str] = None
+    registration_deadline: Optional[str] = None
+    event_date: Optional[str] = None
+    tracking_status: str = Field("Interested")
+    course_id: Optional[int] = None
+    opportunity_id: Optional[int] = None
+    source_platform: str = Field("manual")
+    source_reference: Optional[str] = None
+
+
+class UpdateTrackedOpportunityPayload(BaseModel):
+    title: Optional[str] = Field(None, min_length=1, max_length=255)
+    organizer: Optional[str] = None
+    category: Optional[str] = None
+    description: Optional[str] = None
+    registration_url: Optional[str] = None
+    registration_deadline: Optional[str] = None
+    event_date: Optional[str] = None
+    tracking_status: Optional[str] = None
+    course_id: Optional[int] = None
+
+
+@app.get("/api/student/opportunities")
+def list_student_opportunities_endpoint(
+    category: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
+    course_id: Optional[int] = Query(None),
+    current_user: dict[str, Any] = Depends(require_role("student")),
+) -> list[dict[str, Any]]:
+    """Retrieve all opportunities tracked by the authenticated student.
+    
+    Proactively checks and dispatches due reminders (7d, 3d, 1d) on retrieval.
+    """
+    student_id = current_user["id"]
+    # Check and dispatch due reminders
+    check_and_dispatch_opportunity_reminders(student_id=student_id)
+
+    return list_student_tracked_opportunities(
+        student_id=student_id,
+        category=category,
+        status=status,
+        search=search,
+        course_id=course_id,
+    )
+
+
+@app.post("/api/student/opportunities", status_code=status.HTTP_201_CREATED)
+def track_opportunity_endpoint(
+    payload: TrackOpportunityPayload,
+    current_user: dict[str, Any] = Depends(require_role("student")),
+) -> dict[str, Any]:
+    """Save/track an opportunity for the student, with optional course association."""
+    student_id = current_user["id"]
+
+    # If course_id is provided, verify student is enrolled in that course
+    if payload.course_id is not None:
+        if not is_user_enrolled(payload.course_id, student_id):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="You must be actively enrolled in the course to associate it with this opportunity.",
+            )
+
+    try:
+        tracked = save_tracked_opportunity(
+            student_id=student_id,
+            title=payload.title,
+            organizer=payload.organizer,
+            category=payload.category,
+            description=payload.description,
+            registration_url=payload.registration_url,
+            registration_deadline=payload.registration_deadline,
+            event_date=payload.event_date,
+            tracking_status=payload.tracking_status,
+            course_id=payload.course_id,
+            opportunity_id=payload.opportunity_id,
+            source_platform=payload.source_platform,
+            source_reference=payload.source_reference,
+        )
+        return tracked
+    except ValueError as err:
+        raise HTTPException(status_code=400, detail=str(err))
+
+
+@app.patch("/api/student/opportunities/{tracked_id}")
+def update_tracked_opportunity_endpoint(
+    tracked_id: int,
+    payload: UpdateTrackedOpportunityPayload,
+    current_user: dict[str, Any] = Depends(require_role("student")),
+) -> dict[str, Any]:
+    """Update details or participation status of a tracked opportunity."""
+    student_id = current_user["id"]
+
+    existing = get_tracked_opportunity(tracked_id, student_id=student_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Tracked opportunity not found.")
+
+    if payload.course_id is not None:
+        if not is_user_enrolled(payload.course_id, student_id):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="You must be actively enrolled in the course to associate it.",
+            )
+
+    updates = {k: v for k, v in payload.model_dump().items() if v is not None}
+    updated = update_tracked_opportunity(
+        tracked_id=tracked_id,
+        student_id=student_id,
+        updates=updates,
+    )
+    if not updated:
+        raise HTTPException(status_code=404, detail="Could not update opportunity.")
+    return updated
+
+
+@app.delete("/api/student/opportunities/{tracked_id}")
+def delete_tracked_opportunity_endpoint(
+    tracked_id: int,
+    current_user: dict[str, Any] = Depends(require_role("student")),
+) -> dict[str, Any]:
+    """Remove a tracked opportunity from the student's personal list."""
+    student_id = current_user["id"]
+    success = delete_tracked_opportunity(tracked_id=tracked_id, student_id=student_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Tracked opportunity not found.")
+    return {"status": "deleted", "id": tracked_id}
+
+
+@app.post("/api/student/opportunities/check-reminders")
+def check_student_opportunity_reminders_endpoint(
+    current_user: dict[str, Any] = Depends(require_role("student")),
+) -> dict[str, Any]:
+    """Check registration deadlines and generate reminders (7d, 3d, 1d) for the student."""
+    count = check_and_dispatch_opportunity_reminders(student_id=current_user["id"])
+    return {"status": "success", "dispatched_reminders": count}
+
+
+@app.get("/api/courses/{course_id}/opportunities/analytics")
+def get_course_opportunities_analytics_endpoint(
+    course_id: int,
+    current_user: dict[str, Any] = Depends(require_role("teacher")),
+) -> dict[str, Any]:
+    """Retrieve aggregated opportunity participation analytics for authorized course faculty."""
+    try:
+        return get_course_opportunities_analytics(
+            course_id=course_id,
+            teacher_id=current_user["id"],
+        )
+    except PermissionError as err:
+        raise HTTPException(status_code=403, detail=str(err))
+
+
+@app.get("/api/courses/{course_id}/opportunities/participation")
+def list_course_opportunities_participation_endpoint(
+    course_id: int,
+    category: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    current_user: dict[str, Any] = Depends(require_role("teacher")),
+) -> list[dict[str, Any]]:
+    """Retrieve student opportunity participation records for an authorized course."""
+    try:
+        return list_course_opportunity_participations(
+            course_id=course_id,
+            teacher_id=current_user["id"],
+            category=category,
+            status=status,
+        )
+    except PermissionError as err:
+        raise HTTPException(status_code=403, detail=str(err))

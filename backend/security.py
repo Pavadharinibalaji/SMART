@@ -8,6 +8,7 @@ Implements:
 
 from __future__ import annotations
 
+import config  # Ensures root .env is loaded before accessing environment variables
 import base64
 from datetime import datetime, timezone
 import hashlib
@@ -51,8 +52,22 @@ def get_token_encryption_key() -> tuple[bytes, bool]:
 
 
 def is_secure_persistence_configured() -> bool:
-    """Return True if an explicit persistent encryption key is provided."""
-    return bool(os.environ.get("SMART_TOKEN_ENCRYPTION_KEY", "").strip())
+    """Return True if an explicit persistent encryption key is provided and can initialize Fernet."""
+    env_key = os.environ.get("SMART_TOKEN_ENCRYPTION_KEY", "").strip()
+    if not env_key:
+        return False
+    try:
+        key_bytes = env_key.encode("utf-8")
+        Fernet(key_bytes)
+        return True
+    except Exception:
+        # Validate that derived key succeeds
+        try:
+            derived = base64.urlsafe_b64encode(hashlib.sha256(key_bytes).digest())
+            Fernet(derived)
+            return True
+        except Exception:
+            return False
 
 
 def encrypt_token(token: str) -> str:
@@ -146,3 +161,71 @@ def sanitize_account_for_response(account: dict[str, Any]) -> dict[str, Any]:
     safe["has_refresh_token"] = has_refresh_token
     safe["secure_persistence_configured"] = is_secure_persistence_configured()
     return safe
+
+
+def verify_google_id_token(
+    id_token: str,
+    expected_email: Optional[str] = None,
+    client_id: Optional[str] = None,
+) -> dict[str, Any]:
+    """Verify a Google ID token's authenticity, expiration, and email claims.
+
+    - In development/test environments, supports test tokens with format 'test_google_id_token_<email>' or 'mock_google_token_<email>'.
+    - In live environments, validates token with Google's OAuth2 tokeninfo endpoint.
+    - Verifies email_verified is True.
+    - Verifies expected_email matches the token claim.
+    """
+    if not id_token or not id_token.strip():
+        raise ValueError("Google ID token is required.")
+
+    token_clean = id_token.strip()
+
+    # Development & test harnesses support structured mock tokens
+    smart_env = os.environ.get("SMART_ENV", "development").strip().lower()
+    if smart_env != "production" and (
+        token_clean.startswith("mock_google_token_")
+        or token_clean.startswith("test_google_id_token_")
+    ):
+        parts = token_clean.split("_")
+        token_email = parts[-1].strip().lower()
+        if expected_email and token_email != expected_email.strip().lower():
+            raise ValueError(f"Google ID token email '{token_email}' does not match requested email '{expected_email}'.")
+        return {
+            "email": token_email,
+            "email_verified": True,
+            "aud": client_id or "test-google-client-id",
+            "name": "Verified Google User",
+        }
+
+    # Live verification via Google tokeninfo
+    import httpx
+
+    target_client_id = client_id or os.environ.get("GOOGLE_CLIENT_ID", "").strip()
+
+    try:
+        resp = httpx.get(
+            f"https://oauth2.googleapis.com/tokeninfo?id_token={token_clean}",
+            timeout=10.0,
+        )
+    except Exception as exc:
+        raise ValueError(f"Could not connect to Google token verification service: {exc}")
+
+    if resp.status_code != 200:
+        raise ValueError(f"Google token verification failed (HTTP {resp.status_code}): {resp.text}")
+
+    payload = resp.json()
+    email = (payload.get("email") or "").strip().lower()
+    if not email:
+        raise ValueError("Google ID token did not contain an email claim.")
+
+    email_verified = payload.get("email_verified")
+    if email_verified not in (True, "true", "True", 1, "1"):
+        raise ValueError(f"Google email '{email}' is not marked as verified by Google Workspace.")
+
+    if target_client_id and payload.get("aud") != target_client_id:
+        raise ValueError("Google ID token audience ('aud') does not match configured Google Client ID.")
+
+    if expected_email and email != expected_email.strip().lower():
+        raise ValueError(f"Google ID token email '{email}' does not match login email '{expected_email}'.")
+
+    return payload

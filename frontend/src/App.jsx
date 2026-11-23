@@ -10,9 +10,16 @@ import TaskRelationshipsModal from "./components/TaskRelationshipsModal";
 import DashboardOverview from "./components/DashboardOverview";
 import LoginPage from "./components/LoginPage";
 import OpportunityExplorer from "./components/OpportunityExplorer";
+import OpportunityTrackingModal from "./components/OpportunityTrackingModal";
 import ClassroomProgress from "./components/ClassroomProgress";
 import StudyMaterialsView from "./components/StudyMaterialsView";
 import TeacherDashboard from "./components/TeacherDashboard";
+import CoursesView from "./components/CoursesView";
+import CommunicationView from "./components/CommunicationView";
+import AnnouncementsView from "./components/AnnouncementsView";
+import PollsView from "./components/PollsView";
+import NotificationsCenter from "./components/NotificationsCenter";
+import AnalyticsView from "./components/AnalyticsView";
 import {
   matchesConfidence,
   matchesTaskFilters,
@@ -45,6 +52,9 @@ import {
   loginUser,
   getCurrentUser,
   logoutUser,
+  markTaskReviewed,
+  getUnreadMessageCount,
+  getUnreadNotificationCount,
 } from "./api";
 
 const CATEGORY_COLORS = {
@@ -126,7 +136,7 @@ export default function App() {
 
   // SMART 2.1 - Authenticated User & Google State
   const [currentUser, setCurrentUser] = useState(null);
-  const [authChecking, setAuthChecking] = useState(true);
+  const [authState, setAuthState] = useState("checking"); // 'checking' | 'authenticated' | 'unauthenticated'
   const [googleAccount, setGoogleAccount] = useState({ connected: false });
   const [googleLoading, setGoogleLoading] = useState(false);
   const [googleError, setGoogleError] = useState("");
@@ -140,6 +150,11 @@ export default function App() {
   const [studyMaterials, setStudyMaterials] = useState([]);
   const [teacherOverview, setTeacherOverview] = useState({ coursework: [], opportunities: [] });
 
+  // SMART 3.0 - Collaboration & Notification Counters
+  const [activeCourseChatId, setActiveCourseChatId] = useState(null);
+  const [unreadMessagesCount, setUnreadMessagesCount] = useState(0);
+  const [unreadNotificationsCount, setUnreadNotificationsCount] = useState(0);
+
   const currentEmail = currentUser?.email || "";
   const userRole = currentUser?.role || "student";
 
@@ -148,6 +163,8 @@ export default function App() {
   const [selectedEvidenceItem, setSelectedEvidenceItem] = useState(null);
   const [editModalTask, setEditModalTask] = useState(null);
   const [relationshipsModalTask, setRelationshipsModalTask] = useState(null);
+  const [trackingModalData, setTrackingModalData] = useState(null);
+  const [showTrackingModal, setShowTrackingModal] = useState(false);
   const [exportNotice, setExportNotice] = useState("");
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
 
@@ -234,38 +251,76 @@ export default function App() {
   // Check existing session on mount
   useEffect(() => {
     async function checkAuth() {
-      setAuthChecking(true);
+      setAuthState("checking");
       try {
         const user = await getCurrentUser();
         if (user) {
           setCurrentUser(user);
+          setAuthState("authenticated");
+        } else {
+          setCurrentUser(null);
+          setAuthState("unauthenticated");
         }
       } catch {
         setCurrentUser(null);
-      } finally {
-        setAuthChecking(false);
+        setAuthState("unauthenticated");
       }
     }
     checkAuth();
   }, []);
 
-  // Login handler
-  const handleLogin = async (email) => {
-    const res = await loginUser(email);
-    setCurrentUser(res.user);
-    setActiveTab("dashboard");
+  // Login handler with authoritative verification via /api/auth/me
+  const handleLogin = async (email, idToken = null) => {
+    setAuthState("checking");
+    try {
+      await loginUser(email, idToken);
+      const verifiedUser = await getCurrentUser();
+      if (!verifiedUser) {
+        throw new Error("Session verification failed after login.");
+      }
+      setCurrentUser(verifiedUser);
+      setAuthState("authenticated");
+      setActiveTab("dashboard");
+    } catch (err) {
+      setCurrentUser(null);
+      setAuthState("unauthenticated");
+      throw err;
+    }
   };
 
   // Logout handler
   const handleLogout = async () => {
-    await logoutUser();
+    try {
+      await logoutUser();
+    } catch {
+      // quiet ignore
+    }
     setCurrentUser(null);
+    setAuthState("unauthenticated");
+    setUnreadMessagesCount(0);
+    setUnreadNotificationsCount(0);
     setActiveTab("dashboard");
   };
 
+  // Refresh unread counters for SMART 3.0
+  // Transient counter failures are handled independently and NEVER invalidate a valid SMART session
+  const refreshCounters = useCallback(async () => {
+    if (!currentUser || authState !== "authenticated") return;
+    try {
+      const [msgRes, notifRes] = await Promise.all([
+        getUnreadMessageCount().catch(() => ({ unread_count: 0 })),
+        getUnreadNotificationCount().catch(() => ({ unread_count: 0 })),
+      ]);
+      setUnreadMessagesCount(msgRes?.unread_count || 0);
+      setUnreadNotificationsCount(notifRes?.unread_count || 0);
+    } catch {
+      // Counter fetch failure does not alter session state
+    }
+  }, [currentUser, authState]);
+
   // Initial and reactive load
   useEffect(() => {
-    if (!currentUser) return;
+    if (!currentUser || authState !== "authenticated") return;
     loadSavedTasks();
     loadGoogleStatus();
     loadOpportunities();
@@ -274,14 +329,44 @@ export default function App() {
     if (userRole === "teacher") {
       loadTeacherOverview();
     }
-  }, [currentUser, loadSavedTasks, loadGoogleStatus, loadOpportunities, loadClassroomData, loadMaterials, loadTeacherOverview, userRole]);
+
+    refreshCounters();
+    const interval = setInterval(refreshCounters, 20000);
+    return () => clearInterval(interval);
+  }, [currentUser, authState, refreshCounters, loadSavedTasks, loadGoogleStatus, loadOpportunities, loadClassroomData, loadMaterials, loadTeacherOverview, userRole]);
+
+  // Check post-OAuth redirect query params on mount
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const authSuccess = params.get("google_auth_success");
+    const authError = params.get("google_auth_error");
+
+    if (authSuccess) {
+      setSuccess("Google Account successfully connected!");
+      getCurrentUser()
+        .then((user) => {
+          if (user && user.email) {
+            setCurrentUser(user);
+            setUserRole(user.role || "student");
+            setAuthState("authenticated");
+          }
+        })
+        .catch(() => {});
+      loadGoogleStatus();
+      // Clean up query string from browser URL bar without reloading
+      window.history.replaceState({}, document.title, window.location.pathname);
+    } else if (authError) {
+      setGoogleError(decodeURIComponent(authError));
+      window.history.replaceState({}, document.title, window.location.pathname);
+    }
+  }, [loadGoogleStatus]);
 
   // Handlers for SMART 2.1
   const handleConnectGoogle = async () => {
     try {
       setGoogleLoading(true);
       setGoogleError("");
-      const res = await getGoogleAuthUrl(userRole, window.location.origin + "/oauth2callback");
+      const res = await getGoogleAuthUrl(userRole);
       if (res.auth_url) {
         window.location.href = res.auth_url;
       }
@@ -633,6 +718,25 @@ export default function App() {
     }
   };
 
+  // Review and confirm task (clears review_required, sets status)
+  const handleMarkReviewed = async (taskId, newStatus = "pending") => {
+    setUpdatingTaskId(taskId);
+    setTasksError("");
+    try {
+      const updated = await markTaskReviewed(taskId, newStatus);
+      setSavedTasks((prev) =>
+        prev.map((t) => (t.id === taskId ? updated : t))
+      );
+      if (selectedEvidenceItem && selectedEvidenceItem.id === taskId) {
+        setSelectedEvidenceItem(updated);
+      }
+    } catch (err) {
+      setTasksError(err.message || "Failed to mark task as reviewed.");
+    } finally {
+      setUpdatingTaskId(null);
+    }
+  };
+
   // Update task via edit modal
   const handleEditSave = async (updates) => {
     if (!editModalTask) return;
@@ -785,7 +889,7 @@ export default function App() {
     setTaskSection("all");
   };
 
-  if (authChecking) {
+  if (authState === "checking") {
     return (
       <div className="auth-loading-screen">
         <div className="auth-spinner" aria-hidden="true" />
@@ -794,7 +898,7 @@ export default function App() {
     );
   }
 
-  if (!currentUser) {
+  if (authState !== "authenticated" || !currentUser) {
     return <LoginPage onLoginSuccess={handleLogin} />;
   }
 
@@ -808,11 +912,16 @@ export default function App() {
           if (tab === "tasks") {
             loadSavedTasks();
           }
+          if (tab === "notifications") {
+            refreshCounters();
+          }
         }}
         tasksCount={savedTasks.length}
         candidatesCount={items.length}
         opportunitiesCount={opportunities.length}
         materialsCount={studyMaterials.length}
+        unreadMessagesCount={unreadMessagesCount}
+        unreadNotificationsCount={unreadNotificationsCount}
         user={currentUser}
         googleAccount={googleAccount}
         onSyncGmail={handleSyncGmail}
@@ -879,8 +988,13 @@ export default function App() {
               onExportDeadlines={handleExportDeadlines}
               onSwitchToAnalyze={() => setActiveTab("analyze")}
               onUpdateTaskStatus={handleUpdateStatus}
+              onMarkReviewed={handleMarkReviewed}
               onOpenEvidence={(task) => setSelectedEvidenceItem(task)}
               onOpenEdit={(task) => setEditModalTask(task)}
+              onTrackOpportunity={(data) => {
+                setTrackingModalData(data);
+                setShowTrackingModal(true);
+              }}
               todayStr={todayStr}
             />
           )}
@@ -890,7 +1004,16 @@ export default function App() {
               coursesOverview={teacherOverview.coursework}
               opportunitiesOverview={teacherOverview.opportunities}
               user={currentUser}
-              onRefresh={loadTeacherOverview}
+              submissions={classroomSubmissions}
+              onRefresh={() => {
+                loadTeacherOverview();
+                loadClassroomData();
+              }}
+              onSubmissionGraded={() => {
+                loadTeacherOverview();
+                loadClassroomData();
+              }}
+              onNavigateToTab={(tab) => setActiveTab(tab)}
             />
           )}
         {/* ================================================================= */}
@@ -1887,6 +2010,11 @@ export default function App() {
                   };
 
                   const isUpdating = updatingTaskId === task.id;
+                  const taskMeta = typeof task.source_metadata === "string"
+                    ? (() => { try { return JSON.parse(task.source_metadata); } catch { return {}; } })()
+                    : (task.source_metadata || {});
+                  const gmailLink = taskMeta.gmail_deep_link || (task.source_type === "gmail" && taskMeta.threadId ? `https://mail.google.com/mail/u/0/#all/${taskMeta.threadId}` : null);
+                  const taskUrls = Array.isArray(taskMeta.extracted_urls) ? taskMeta.extracted_urls : [];
 
                   return (
                     <article
@@ -2027,6 +2155,50 @@ export default function App() {
                         variant="box"
                       />
 
+                      {/* Shared URLs & Direct Gmail Evidence Link */}
+                      {(gmailLink || taskUrls.length > 0) && (
+                        <div className="task-links-row" style={{ display: "flex", flexWrap: "wrap", gap: "8px", margin: "10px 0" }}>
+                          {gmailLink && (
+                            <a
+                              href={gmailLink}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="btn-gmail-pill"
+                              title="Open original conversation thread in Gmail"
+                            >
+                              <span>✉️</span> View Original Email ↗
+                            </a>
+                          )}
+                          {taskUrls.map((u, uIdx) => (
+                            <a
+                              key={uIdx}
+                              href={u.url}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="btn-url-pill"
+                              title={u.url}
+                            >
+                              <span className="url-kind-tag">
+                                {u.kind === "google_form"
+                                  ? "Form"
+                                  : u.kind === "classroom"
+                                  ? "Classroom"
+                                  : u.kind === "drive"
+                                  ? "Drive"
+                                  : u.kind === "registration"
+                                  ? "Register"
+                                  : u.kind === "competition"
+                                  ? "Contest"
+                                  : u.kind === "meeting"
+                                  ? "Meet"
+                                  : "Link"}
+                              </span>
+                              <span>{u.label || "Resource"} ↗</span>
+                            </a>
+                          ))}
+                        </div>
+                      )}
+
                       {/* Expandable Source Evidence */}
                       <details className="source-evidence">
                         <summary className="evidence-summary">
@@ -2050,6 +2222,19 @@ export default function App() {
                       <div className="task-actions-row">
                         <div className="status-switch-group">
                           <span className="status-control-label">Status:</span>
+
+                          {task.review_required && (
+                            <button
+                              type="button"
+                              onClick={() => handleMarkReviewed(task.id, "pending")}
+                              disabled={isUpdating}
+                              className="btn-review-confirm"
+                              title="Approve and mark this task as reviewed pending"
+                              aria-label="Approve task"
+                            >
+                              ✓ Review &amp; Confirm
+                            </button>
+                          )}
 
                           {task.status === "completed" ? (
                             <button
@@ -2160,17 +2345,20 @@ export default function App() {
               coursework={classroomCoursework}
               submissions={classroomSubmissions}
               onSync={handleSyncClassroom}
+              onSubmissionsUpdated={loadClassroomData}
               loading={classroomLoading}
             />
           )}
 
           {/* ================================================================= */}
-          {/* TAB 5: STUDY MATERIALS REPOSITORY (SMART 2.1)                     */}
+          {/* TAB 5: STUDY MATERIALS REPOSITORY (SMART 2.1 & 3.1)               */}
           {/* ================================================================= */}
           {activeTab === "materials" && (
             <StudyMaterialsView
               materials={studyMaterials}
               courses={classroomCourses}
+              user={currentUser}
+              userRole={userRole}
             />
           )}
 
@@ -2182,7 +2370,76 @@ export default function App() {
               coursesOverview={teacherOverview.coursework}
               opportunitiesOverview={teacherOverview.opportunities}
               user={currentUser}
-              onRefresh={loadTeacherOverview}
+              submissions={classroomSubmissions}
+              onRefresh={() => {
+                loadTeacherOverview();
+                loadClassroomData();
+              }}
+              onSubmissionGraded={() => {
+                loadTeacherOverview();
+                loadClassroomData();
+              }}
+              onNavigateToTab={(tab) => setActiveTab(tab)}
+            />
+          )}
+
+          {/* ================================================================= */}
+          {/* TAB 7: SMART COURSES & ROSTERS (SMART 3.0)                        */}
+          {/* ================================================================= */}
+          {activeTab === "courses" && (
+            <CoursesView
+              user={currentUser}
+              onSelectCourseChat={(courseId) => {
+                setActiveCourseChatId(courseId);
+                setActiveTab("communication");
+              }}
+            />
+          )}
+
+          {/* ================================================================= */}
+          {/* TAB 8: REAL-TIME COMMUNICATION (SMART 3.0)                        */}
+          {/* ================================================================= */}
+          {activeTab === "communication" && (
+            <CommunicationView
+              user={currentUser}
+              initialCourseId={activeCourseChatId}
+            />
+          )}
+
+          {/* ================================================================= */}
+          {/* TAB 9: ANNOUNCEMENTS & BROADCASTS (SMART 3.0)                     */}
+          {/* ================================================================= */}
+          {activeTab === "announcements" && (
+            <AnnouncementsView
+              user={currentUser}
+            />
+          )}
+
+          {/* ================================================================= */}
+          {/* TAB 10: INTERACTIVE POLLS (SMART 3.0)                             */}
+          {/* ================================================================= */}
+          {activeTab === "polls" && (
+            <PollsView
+              user={currentUser}
+            />
+          )}
+
+          {/* ================================================================= */}
+          {/* TAB 11: NOTIFICATIONS CENTER (SMART 3.0)                          */}
+          {/* ================================================================= */}
+          {activeTab === "notifications" && (
+            <NotificationsCenter
+              onSelectTab={(tab) => setActiveTab(tab)}
+              onNotificationUpdate={refreshCounters}
+            />
+          )}
+
+          {/* ================================================================= */}
+          {/* TAB 12: ENGAGEMENT ANALYTICS (SMART 3.0)                          */}
+          {/* ================================================================= */}
+          {activeTab === "analytics" && (
+            <AnalyticsView
+              user={currentUser}
             />
           )}
         </main>
@@ -2267,8 +2524,26 @@ export default function App() {
         <EvidenceDrawer
           item={selectedEvidenceItem}
           onClose={() => setSelectedEvidenceItem(null)}
+          onMarkReviewed={handleMarkReviewed}
+          onTrackOpportunity={(data) => {
+            setTrackingModalData(data);
+            setShowTrackingModal(true);
+          }}
         />
       )}
+
+      {/* Opportunity Tracking Modal (SMART 3.2) */}
+      <OpportunityTrackingModal
+        isOpen={showTrackingModal}
+        onClose={() => {
+          setShowTrackingModal(false);
+          setTrackingModalData(null);
+        }}
+        initialData={trackingModalData}
+        onSaved={() => {
+          loadOpportunitiesData();
+        }}
+      />
     </div>
   );
 }

@@ -1,13 +1,39 @@
 import { useState } from "react";
+import { turnInCoursework } from "../api";
 
 export default function ClassroomProgress({
   courses = [],
   coursework = [],
   submissions = [],
   onSyncClassroom,
+  onSubmissionsUpdated,
   loading = false,
 }) {
   const [selectedCourseId, setSelectedCourseId] = useState("ALL");
+  const [submittingCwId, setSubmittingCwId] = useState(null);
+  const [feedbackMsg, setFeedbackMsg] = useState(null);
+
+  const handleTurnIn = async (cw) => {
+    setSubmittingCwId(cw.id);
+    setFeedbackMsg(null);
+    try {
+      await turnInCoursework(cw.id, cw.alternate_link);
+      setFeedbackMsg({
+        type: "success",
+        text: `Successfully turned in "${cw.title}". Your submission is pending grading.`,
+      });
+      if (onSubmissionsUpdated) {
+        onSubmissionsUpdated();
+      }
+    } catch (err) {
+      setFeedbackMsg({
+        type: "error",
+        text: err.message || "Failed to turn in assignment. Please try again.",
+      });
+    } finally {
+      setSubmittingCwId(null);
+    }
+  };
 
   const filteredCoursework = coursework.filter((cw) => {
     if (selectedCourseId === "ALL") return true;
@@ -41,6 +67,33 @@ export default function ClassroomProgress({
           )}
         </div>
       </div>
+
+      {/* Feedback banner */}
+      {feedbackMsg && (
+        <div
+          className={`saas-alert-banner ${feedbackMsg.type === "success" ? "alert-success" : "alert-error"}`}
+          style={{
+            padding: "12px 16px",
+            marginBottom: 20,
+            borderRadius: 8,
+            backgroundColor: feedbackMsg.type === "success" ? "rgba(16, 185, 129, 0.1)" : "rgba(239, 68, 68, 0.1)",
+            color: feedbackMsg.type === "success" ? "#065f46" : "#991b1b",
+            border: `1px solid ${feedbackMsg.type === "success" ? "#a7f3d0" : "#fecaca"}`,
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+          }}
+        >
+          <span>{feedbackMsg.text}</span>
+          <button
+            type="button"
+            onClick={() => setFeedbackMsg(null)}
+            style={{ background: "none", border: "none", cursor: "pointer", fontWeight: "bold" }}
+          >
+            ×
+          </button>
+        </div>
+      )}
 
       {/* Courses Cards */}
       <div className="courses-section">
@@ -155,16 +208,42 @@ export default function ClassroomProgress({
                         <span className="grade-val">{grade}</span>
                       </td>
                       <td>
-                        {cw.alternate_link && (
-                          <a
-                            href={cw.alternate_link}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="saas-outline-btn-sm"
-                          >
-                            Submit ↗
-                          </a>
-                        )}
+                        <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+                          {state !== "TURNED_IN" && state !== "RETURNED" ? (
+                            <button
+                              type="button"
+                              className="saas-primary-btn"
+                              style={{ padding: "6px 12px", fontSize: "0.8125rem", whiteSpace: "nowrap" }}
+                              onClick={() => handleTurnIn(cw)}
+                              disabled={submittingCwId === cw.id}
+                            >
+                              {submittingCwId === cw.id ? "Turning In..." : "Turn In"}
+                            </button>
+                          ) : (
+                            <button
+                              type="button"
+                              className="saas-outline-btn-sm"
+                              style={{ padding: "6px 12px", fontSize: "0.8125rem", whiteSpace: "nowrap" }}
+                              onClick={() => handleTurnIn(cw)}
+                              disabled={submittingCwId === cw.id}
+                              title="Resubmit your coursework"
+                            >
+                              {submittingCwId === cw.id ? "Submitting..." : "Resubmit"}
+                            </button>
+                          )}
+                          {cw.alternate_link && (
+                            <a
+                              href={cw.alternate_link}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="saas-outline-btn-sm"
+                              style={{ padding: "6px 10px", fontSize: "0.8125rem", textDecoration: "none" }}
+                              title="Open assignment in Google Classroom"
+                            >
+                              Open ↗
+                            </a>
+                          )}
+                        </div>
                       </td>
                     </tr>
                   );

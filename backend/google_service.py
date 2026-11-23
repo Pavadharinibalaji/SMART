@@ -11,10 +11,12 @@ Implements:
 
 from __future__ import annotations
 
+import config  # Ensures root .env is loaded before accessing environment variables
 import base64
 from datetime import datetime, timezone
 import json
 import os
+import re
 from typing import Any, Optional
 import urllib.parse
 
@@ -22,7 +24,12 @@ import httpx
 
 from competition_extractor import extract_competition_opportunity
 from database import (
+    find_associated_task,
+    find_duplicate_item,
+    get_academic_item_by_id,
     get_google_account,
+    save_academic_item,
+    save_academic_item_with_association,
     save_classroom_course,
     save_classroom_coursework,
     save_classroom_submission,
@@ -36,6 +43,7 @@ from security import (
     decrypt_token,
     encrypt_token,
     generate_oauth_state,
+    is_secure_persistence_configured,
     validate_oauth_state,
 )
 from source_adapters import GmailAdapter
@@ -54,6 +62,7 @@ READONLY_SCOPES = [
     "https://www.googleapis.com/auth/classroom.courses.readonly",
     "https://www.googleapis.com/auth/classroom.coursework.me.readonly",
     "https://www.googleapis.com/auth/classroom.coursework.students.readonly",
+    "https://www.googleapis.com/auth/classroom.courseworkmaterials.readonly",
 ]
 
 
@@ -76,7 +85,7 @@ def build_authorization_url(
 ) -> dict[str, Any]:
     """Generate the Google OAuth 2.0 authorization URL with CSRF state token."""
     client_id, _ = get_oauth_credentials()
-    clean_redirect = (redirect_uri or os.environ.get("GOOGLE_REDIRECT_URI", "http://localhost:5173/auth/callback")).strip()
+    clean_redirect = (redirect_uri or os.environ.get("GOOGLE_REDIRECT_URI", "http://localhost:8000/api/auth/google/callback")).strip()
 
     if not client_id:
         return {
@@ -114,7 +123,7 @@ async def exchange_code_for_tokens(code: str, state: str) -> dict[str, Any]:
     if not client_id or not client_secret:
         raise ValueError("Google OAuth credentials are not configured on the server.")
 
-    redirect_uri = state_payload.get("redirect_uri") or os.environ.get("GOOGLE_REDIRECT_URI", "http://localhost:5173/auth/callback")
+    redirect_uri = state_payload.get("redirect_uri") or os.environ.get("GOOGLE_REDIRECT_URI", "http://localhost:8000/api/auth/google/callback")
     role = state_payload.get("role", "student")
 
     async with httpx.AsyncClient(timeout=15.0) as client:
@@ -211,6 +220,202 @@ async def get_valid_access_token(account: dict[str, Any]) -> str:
     raise ValueError("Token is expired and could not be refreshed. Please reconnect your Google account.")
 
 
+def extract_urls_with_labels(text: str, html: Optional[str] = None) -> list[dict[str, str]]:
+    """Extract, normalize, label, and deduplicate academic/action URLs from email text and HTML.
+
+    Filters out mailto:, javascript:, and internal Gmail tracking / unsubscribe links.
+    Strips tracking query parameters (utm_*) and classifies URL kinds.
+    """
+    raw_candidates: list[tuple[str, str]] = []  # (url, context_or_anchor)
+
+    # 1. Extract from HTML anchor tags if provided
+    if html:
+        anchor_pattern = re.compile(r'<a\s+[^>]*href=["\'](https?://[^"\']+)["\'][^>]*>(.*?)</a>', re.IGNORECASE | re.DOTALL)
+        for m in anchor_pattern.finditer(html):
+            url = m.group(1).strip()
+            anchor_text = re.sub(r'<[^>]+>', ' ', m.group(2)).strip()
+            raw_candidates.append((url, anchor_text))
+
+    # 2. Extract from plain text
+    url_pattern = re.compile(r'https?://[^\s<>"\',;)]+', re.IGNORECASE)
+    for m in url_pattern.finditer(text):
+        url = m.group(0).rstrip(".,!?;:)]}>\"'")
+        # Capture surrounding 60 chars context
+        start = max(0, m.start() - 30)
+        end = min(len(text), m.end() + 30)
+        context = text[start:end]
+        raw_candidates.append((url, context))
+
+    seen_urls = set()
+    extracted: list[dict[str, str]] = []
+
+    TRACKING_PARAMS = {
+        "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+        "gclid", "fbclid", "mc_cid", "mc_eid"
+    }
+
+    for raw_url, context in raw_candidates:
+        # Validate scheme
+        if not (raw_url.startswith("http://") or raw_url.startswith("https://")):
+            continue
+
+        # Filter out tracking/unsubscribe/service links
+        url_lower = raw_url.lower()
+        if any(bad in url_lower for bad in (
+            "unsubscribe", "mail.google.com/mail/u/", "google.com/url?", "notifications.google.com",
+            "list-manage.com", "doubleclick.net", "facebook.com", "twitter.com", "instagram.com"
+        )):
+            continue
+
+        # Strip tracking query parameters
+        try:
+            parsed = urllib.parse.urlparse(raw_url)
+            query_tuples = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+            cleaned_query = [
+                (k, v) for k, v in query_tuples if k.lower() not in TRACKING_PARAMS
+            ]
+            new_query = urllib.parse.urlencode(cleaned_query)
+            clean_url = urllib.parse.urlunparse(
+                (parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment)
+            )
+        except Exception:
+            clean_url = raw_url
+
+        # Clean trailing slashes for deduplication key
+        clean_key = clean_url.rstrip("/")
+        if clean_key in seen_urls:
+            continue
+        seen_urls.add(clean_key)
+
+        clean_lower = clean_url.lower()
+        ctx_lower = (context or "").lower()
+
+        # Determine category kind and label
+        kind = "generic"
+        label = ""
+
+        # Prioritize non-empty, non-URL anchor text if available
+        if context and not context.startswith("http://") and not context.startswith("https://") and len(context) > 2:
+            label = context
+
+        if "forms.gle" in clean_lower or "docs.google.com/forms" in clean_lower:
+            kind = "google_form"
+            if not label:
+                label = "Open Submission Form" if any(w in ctx_lower for w in ("submit", "assignment", "lab")) else "Open Google Form"
+        elif "classroom.google.com" in clean_lower:
+            kind = "classroom"
+            if not label:
+                label = "View in Google Classroom"
+        elif "drive.google.com" in clean_lower or "docs.google.com" in clean_lower:
+            kind = "drive"
+            if not label:
+                if "presentation" in clean_lower or "slide" in ctx_lower:
+                    label = "View Presentation Slides"
+                elif "sheet" in clean_lower or "spreadsheet" in ctx_lower:
+                    label = "View Spreadsheet"
+                else:
+                    label = "Access Document / Material"
+        elif any(w in clean_lower or w in ctx_lower for w in ("codeforces.com", "kaggle.com", "leetcode.com", "hackerearth.com", "devpost.com", "hackathon", "contest", "challenge")):
+            kind = "competition"
+            if not label:
+                label = "Visit Competition Website"
+        elif any(w in clean_lower or w in ctx_lower for w in ("meet.google.com", "zoom.us", "teams.microsoft.com", "webex.com")):
+            kind = "meeting"
+            if not label:
+                label = "Join Video Meeting"
+        elif any(w in ctx_lower for w in ("register", "registration", "signup", "sign up", "apply")):
+            kind = "registration"
+            if not label:
+                label = "View Registration Page"
+        elif any(w in clean_lower for w in ("github.com", "gitlab.com")):
+            kind = "reference"
+            if not label:
+                label = "View Code Repository"
+        elif any(w in ctx_lower for w in ("syllabus", "notes", "lecture", "slide", "study")):
+            kind = "reference"
+            if not label:
+                label = "Access Study Material"
+
+        if not label:
+            try:
+                domain = urllib.parse.urlparse(clean_url).netloc.replace("www.", "")
+                label = f"Visit {domain}" if domain else "Open Resource Link"
+            except Exception:
+                label = "Open Resource Link"
+
+        extracted.append({
+            "url": clean_url,
+            "label": label,
+            "kind": kind,
+        })
+
+    return extracted
+
+
+def _decode_gmail_body_with_html(payload: dict[str, Any]) -> tuple[str, str]:
+    """Recursively extract plain text and HTML body from a Gmail API message payload."""
+    if not payload:
+        return "", ""
+
+    plain_text = ""
+    html_content = ""
+
+    body_data = payload.get("body", {}).get("data")
+    mime = payload.get("mimeType", "")
+    if body_data:
+        try:
+            decoded = base64.urlsafe_b64decode(body_data.encode("ASCII")).decode("utf-8", errors="replace")
+            if mime == "text/html":
+                html_content = decoded
+            else:
+                plain_text = decoded
+        except Exception:
+            pass
+
+    parts = payload.get("parts", [])
+    for part in parts:
+        p_mime = part.get("mimeType", "")
+        p_data = part.get("body", {}).get("data")
+        if p_data:
+            try:
+                dec = base64.urlsafe_b64decode(p_data.encode("ASCII")).decode("utf-8", errors="replace")
+                if p_mime == "text/plain" and not plain_text:
+                    plain_text = dec
+                elif p_mime == "text/html" and not html_content:
+                    html_content = dec
+            except Exception:
+                pass
+        elif p_mime.startswith("multipart/"):
+            sub_plain, sub_html = _decode_gmail_body_with_html(part)
+            if sub_plain and not plain_text:
+                plain_text = sub_plain
+            if sub_html and not html_content:
+                html_content = sub_html
+
+    if not plain_text and html_content:
+        # Strip HTML tags for readable plain text
+        clean = re.sub(r"<[^>]+>", " ", html_content)
+        plain_text = " ".join(clean.split())
+
+    return plain_text, html_content
+
+
+def _decode_gmail_body(payload: dict[str, Any]) -> str:
+    """Recursively extract plain text body from a Gmail API message payload."""
+    text, _ = _decode_gmail_body_with_html(payload)
+    return text
+
+
+def _extract_gmail_headers(payload: dict[str, Any]) -> dict[str, str]:
+    """Extract standard email headers (From, Subject, Date) from Gmail message payload."""
+    headers = {}
+    for h in payload.get("headers", []):
+        name = h.get("name", "").lower()
+        if name in ("from", "subject", "date", "to", "cc"):
+            headers[name] = h.get("value", "")
+    return headers
+
+
 # ==============================================================================
 # Live Gmail API Synchronization
 # ==============================================================================
@@ -222,7 +427,7 @@ async def sync_live_gmail(account: dict[str, Any], max_messages: int = 15) -> di
     email_address = account.get("email", "")
 
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-    query = "subject:(assignment OR exam OR test OR project OR hackathon OR competition OR contest OR submission OR deadline OR internal)"
+    query = "subject:(assignment OR exam OR test OR project OR hackathon OR competition OR contest OR submission OR deadline OR internal OR class OR lecture)"
 
     async with httpx.AsyncClient(timeout=20.0) as client:
         list_resp = await client.get(
@@ -241,24 +446,150 @@ async def sync_live_gmail(account: dict[str, Any], max_messages: int = 15) -> di
             now_iso = datetime.now(timezone.utc).isoformat()
             account["last_sync_gmail"] = now_iso
             save_google_account(account)
-            return {"synced_count": 0, "extracted_tasks": 0, "extracted_competitions": 0, "is_demo": False}
+            return {"synced_count": 0, "extracted_tasks": 0, "extracted_competitions": 0, "extracted_materials": 0, "last_sync": now_iso, "is_demo": False}
 
         raw_emails: list[dict[str, Any]] = []
+        normalized_emails: list[dict[str, Any]] = []
+
         for it in msg_items:
             mid = it.get("id")
             detail_resp = await client.get(f"{GMAIL_MESSAGES_ENDPOINT}/{mid}", headers=headers)
             if detail_resp.status_code == 200:
-                raw_emails.append(detail_resp.json())
+                raw_msg = detail_resp.json()
+                raw_emails.append(raw_msg)
+                payload = raw_msg.get("payload", {})
+                h = _extract_gmail_headers(payload)
+                body_plain, body_html = _decode_gmail_body_with_html(payload)
+                body = body_plain or raw_msg.get("snippet", "")
+                thread_id = raw_msg.get("threadId") or mid
 
-    # Parse and extract
+                # Extract shared links from email body and html
+                extracted_urls = extract_urls_with_labels(body, body_html)
+
+                # Direct Gmail message/conversation URL using actual threadId
+                gmail_deep_link = f"https://mail.google.com/mail/u/0/#all/{thread_id}"
+
+                normalized_emails.append({
+                    "id": mid,
+                    "sender": h.get("from", "Unknown Sender"),
+                    "timestamp": h.get("date", ""),
+                    "subject": h.get("subject", ""),
+                    "body": body,
+                    "labels": raw_msg.get("labelIds", []),
+                    "threadId": thread_id,
+                    "gmail_deep_link": gmail_deep_link,
+                    "extracted_urls": extracted_urls,
+                })
+
+    # Parse via GmailAdapter
     adapter = GmailAdapter()
-    source_messages = adapter.parse(raw_emails)
+    source_messages = adapter.parse(normalized_emails)
     message_dicts = [m.to_dict() for m in source_messages]
 
     # Academic tasks extraction
     extracted_items = extract_academic_items(message_dicts)
+    saved_tasks_count = 0
 
-    # Competitions extraction
+    for item in extracted_items:
+        # Match email metadata to associate deep link and URLs
+        source_id = item.get("source_id")
+        matching_norm = next((em for em in normalized_emails if em.get("id") == source_id), None)
+        task_meta = item.get("source_metadata") or {}
+        if not isinstance(task_meta, dict):
+            task_meta = {}
+
+        if matching_norm:
+            task_meta["threadId"] = matching_norm.get("threadId")
+            task_meta["gmail_deep_link"] = matching_norm.get("gmail_deep_link")
+            task_meta["extracted_urls"] = matching_norm.get("extracted_urls", [])
+
+        # Build trusted save payload with source provenance
+        trusted_payload = {
+            "title": item.get("title"),
+            "category": item.get("category", "General"),
+            "description": item.get("description") or item.get("source_text", ""),
+            "date_text": item.get("date_text"),
+            "due_date": item.get("due_date"),
+            "date_type": item.get("date_type"),
+            "date_status": item.get("date_status"),
+            "status": "pending",
+            "source_sender": item.get("source_sender"),
+            "source_timestamp": item.get("source_timestamp"),
+            "source_text": item.get("source_text"),
+            "source_filename": "Gmail Live Sync",
+            "source_type": "gmail",
+            "source_id": source_id,
+            "source_metadata": task_meta,
+            "review_required": item.get("review_required", False),
+            "review_reasons": item.get("review_reasons", []),
+            "evidence_text": item.get("evidence_text"),
+            "evidence_start_index": item.get("evidence_start_index"),
+            "evidence_end_index": item.get("evidence_end_index"),
+            "_trusted_confidence": item.get("confidence", "HIGH"),
+            "_trusted_confidence_reasons": item.get("confidence_reasons") or [],
+            "_trusted_evidence": True,
+            "is_actionable": item.get("is_actionable", True),
+            "actionability_type": item.get("actionability_type", "action_required"),
+            "importance": item.get("importance", "UNASSESSED"),
+            "academic_intent": item.get("academic_intent"),
+        }
+
+        # Deduplication check
+        dup = find_duplicate_item(
+            source_text=item.get("source_text"),
+            source_timestamp=item.get("source_timestamp"),
+            source_sender=item.get("source_sender"),
+            category=item.get("category"),
+            source_filename="Gmail Live Sync",
+            source_type="gmail",
+            source_id=item.get("source_id"),
+            title=item.get("title"),
+            evidence_text=item.get("evidence_text"),
+            evidence_start_index=item.get("evidence_start_index"),
+            due_date=item.get("due_date"),
+        )
+        if not dup:
+            eff_update_type = item.get("update_type")
+            target_id = None
+            target_old_reasons: list[str] = []
+
+            if eff_update_type in (
+                "extension",
+                "postponement",
+                "rescheduled",
+                "revision",
+                "replacement",
+                "cancellation",
+                "window_change",
+            ):
+                associated = find_associated_task(trusted_payload)
+                if associated and associated.get("id"):
+                    target_id = associated["id"]
+                    target_task = get_academic_item_by_id(target_id)
+                    if target_task:
+                        target_old_reasons = target_task.get("review_reasons") or []
+                        trusted_payload["replaces_task_id"] = target_id
+                        if eff_update_type == "cancellation":
+                            c_reason = "Deadline cancelled by subsequent announcement."
+                            if c_reason not in target_old_reasons:
+                                target_old_reasons.append(c_reason)
+                            trusted_payload["status"] = "cancelled"
+                        elif not trusted_payload.get("previous_due_date"):
+                            trusted_payload["previous_due_date"] = associated.get("due_date")
+
+            if target_id:
+                save_academic_item_with_association(
+                    data=trusted_payload,
+                    target_id=target_id,
+                    target_status="cancelled" if eff_update_type == "cancellation" else "superseded",
+                    target_review_required=True if eff_update_type == "cancellation" else None,
+                    target_review_reasons=target_old_reasons if eff_update_type == "cancellation" else None,
+                )
+            else:
+                save_academic_item(trusted_payload)
+            saved_tasks_count += 1
+
+    # Competitions and study materials extraction
     opp_count = 0
     mat_count = 0
     for sm in source_messages:
@@ -309,7 +640,7 @@ async def sync_live_gmail(account: dict[str, Any], max_messages: int = 15) -> di
 
     return {
         "synced_count": len(source_messages),
-        "extracted_tasks": len(extracted_items),
+        "extracted_tasks": saved_tasks_count,
         "extracted_competitions": opp_count,
         "extracted_materials": mat_count,
         "last_sync": now_iso,
@@ -344,6 +675,7 @@ async def sync_live_classroom(account: dict[str, Any]) -> dict[str, Any]:
         saved_course_count = 0
         saved_coursework_count = 0
         saved_sub_count = 0
+        saved_material_count = 0
 
         for c in courses:
             cid = c.get("id")
@@ -397,6 +729,41 @@ async def sync_live_classroom(account: dict[str, Any]) -> dict[str, Any]:
                     save_classroom_coursework(cw_record)
                     saved_coursework_count += 1
 
+                    # Index attached course materials if present in coursework
+                    for mat_item in cw.get("materials", []):
+                        drive_file = mat_item.get("driveFile", {}).get("driveFile", {})
+                        if drive_file:
+                            f_title = drive_file.get("title") or "Classroom Attachment"
+                            save_study_material({
+                                "title": f_title,
+                                "file_name": f_title,
+                                "file_type": "application/pdf",
+                                "file_size": 0,
+                                "file_url": drive_file.get("alternateLink") or cw.get("alternateLink"),
+                                "source_type": "classroom_material",
+                                "source_id": drive_file.get("id") or cw_id,
+                                "course_id": cid,
+                                "course_name": c.get("name"),
+                                "uploaded_by": c.get("name"),
+                                "is_demo": 0,
+                            })
+                        link_item = mat_item.get("link", {})
+                        if link_item:
+                            l_title = link_item.get("title") or "Classroom Resource Link"
+                            save_study_material({
+                                "title": l_title,
+                                "file_name": l_title,
+                                "file_type": "text/html",
+                                "file_size": 0,
+                                "file_url": link_item.get("url"),
+                                "source_type": "classroom_material",
+                                "source_id": f"link_{cw_id}_{l_title[:10]}",
+                                "course_id": cid,
+                                "course_name": c.get("name"),
+                                "uploaded_by": c.get("name"),
+                                "is_demo": 0,
+                            })
+
                     # 3. Fetch submissions (if teacher or student)
                     sub_url = f"{CLASSROOM_COURSES_ENDPOINT}/{cid}/courseWork/{cw_id}/studentSubmissions"
                     sub_params = {}
@@ -421,6 +788,131 @@ async def sync_live_classroom(account: dict[str, Any]) -> dict[str, Any]:
                             save_classroom_submission(sub_rec)
                             saved_sub_count += 1
 
+            # 3. Fetch Course Study Materials (courses.courseWorkMaterials.list)
+            mat_page_token = None
+            while True:
+                mat_params = {"courseMaterialStates": "PUBLISHED"}
+                if mat_page_token:
+                    mat_params["pageToken"] = mat_page_token
+                cwm_resp = await client.get(
+                    f"{CLASSROOM_COURSES_ENDPOINT}/{cid}/courseWorkMaterials",
+                    headers=headers,
+                    params=mat_params,
+                )
+                if cwm_resp.status_code == 200:
+                    cwm_data = cwm_resp.json()
+                    for cwm in cwm_data.get("courseWorkMaterial", []):
+                        cwm_id = cwm.get("id")
+                        cwm_title = cwm.get("title") or "Course Material"
+                        cwm_desc = cwm.get("description") or ""
+                        cwm_materials = cwm.get("materials", [])
+                        cwm_link = cwm.get("alternateLink")
+
+                        # If no nested items, save the entry itself
+                        if not cwm_materials:
+                            save_study_material({
+                                "title": cwm_title,
+                                "file_name": cwm_title,
+                                "file_type": "text/html",
+                                "file_size": 0,
+                                "file_url": cwm_link,
+                                "source_type": "classroom_material",
+                                "source_id": cwm_id,
+                                "course_id": cid,
+                                "course_name": c.get("name"),
+                                "uploaded_by": c.get("name"),
+                                "is_demo": 0,
+                            })
+                            saved_material_count += 1
+
+                        for m_idx, mat_item in enumerate(cwm_materials):
+                            # Drive File attachment
+                            drive_file = mat_item.get("driveFile", {}).get("driveFile", {})
+                            if drive_file:
+                                f_title = drive_file.get("title") or cwm_title
+                                f_type = "application/pdf" if f_title.lower().endswith(".pdf") else "application/octet-stream"
+                                save_study_material({
+                                    "title": f_title,
+                                    "file_name": f_title,
+                                    "file_type": f_type,
+                                    "file_size": 0,
+                                    "file_url": drive_file.get("alternateLink") or cwm_link,
+                                    "source_type": "classroom_material",
+                                    "source_id": drive_file.get("id") or f"{cwm_id}_drive_{m_idx}",
+                                    "course_id": cid,
+                                    "course_name": c.get("name"),
+                                    "uploaded_by": c.get("name"),
+                                    "is_demo": 0,
+                                    "description": cwm_desc,
+                                })
+                                saved_material_count += 1
+
+                            # External Link
+                            link_item = mat_item.get("link", {})
+                            if link_item:
+                                l_title = link_item.get("title") or cwm_title
+                                save_study_material({
+                                    "title": l_title,
+                                    "file_name": l_title,
+                                    "file_type": "text/html",
+                                    "file_size": 0,
+                                    "file_url": link_item.get("url"),
+                                    "source_type": "classroom_material",
+                                    "source_id": f"link_{cwm_id}_{m_idx}",
+                                    "course_id": cid,
+                                    "course_name": c.get("name"),
+                                    "uploaded_by": c.get("name"),
+                                    "is_demo": 0,
+                                    "description": cwm_desc,
+                                })
+                                saved_material_count += 1
+
+                            # YouTube Video
+                            yt_item = mat_item.get("youtubeVideo", {})
+                            if yt_item:
+                                yt_title = yt_item.get("title") or f"{cwm_title} (Video)"
+                                save_study_material({
+                                    "title": yt_title,
+                                    "file_name": yt_title,
+                                    "file_type": "video/youtube",
+                                    "file_size": 0,
+                                    "file_url": yt_item.get("alternateLink"),
+                                    "source_type": "classroom_material",
+                                    "source_id": yt_item.get("id") or f"yt_{cwm_id}_{m_idx}",
+                                    "course_id": cid,
+                                    "course_name": c.get("name"),
+                                    "uploaded_by": c.get("name"),
+                                    "is_demo": 0,
+                                    "description": cwm_desc,
+                                })
+                                saved_material_count += 1
+
+                            # Google Form
+                            form_item = mat_item.get("form", {})
+                            if form_item:
+                                form_title = form_item.get("title") or f"{cwm_title} (Form)"
+                                save_study_material({
+                                    "title": form_title,
+                                    "file_name": form_title,
+                                    "file_type": "application/x-google-form",
+                                    "file_size": 0,
+                                    "file_url": form_item.get("formUrl") or form_item.get("responseUrl"),
+                                    "source_type": "classroom_material",
+                                    "source_id": f"form_{cwm_id}_{m_idx}",
+                                    "course_id": cid,
+                                    "course_name": c.get("name"),
+                                    "uploaded_by": c.get("name"),
+                                    "is_demo": 0,
+                                    "description": cwm_desc,
+                                })
+                                saved_material_count += 1
+
+                    mat_page_token = cwm_data.get("nextPageToken")
+                    if not mat_page_token:
+                        break
+                else:
+                    break
+
     now_iso = datetime.now(timezone.utc).isoformat()
     account["last_sync_classroom"] = now_iso
     save_google_account(account)
@@ -429,6 +921,7 @@ async def sync_live_classroom(account: dict[str, Any]) -> dict[str, Any]:
         "courses_count": saved_course_count,
         "coursework_count": saved_coursework_count,
         "submissions_count": saved_sub_count,
+        "materials_count": saved_material_count,
         "last_sync": now_iso,
         "is_demo": False,
     }

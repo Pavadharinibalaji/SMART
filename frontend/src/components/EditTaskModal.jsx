@@ -11,6 +11,7 @@ export default function EditTaskModal({ task, onClose, onSave }) {
   const [importance, setImportance] = useState(task.importance || "UNASSESSED");
   const [status, setStatus] = useState((task.status || "pending").toLowerCase());
   const [description, setDescription] = useState(task.description || "");
+  const [reviewRequired, setReviewRequired] = useState(Boolean(task.review_required));
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
 
@@ -32,6 +33,7 @@ export default function EditTaskModal({ task, onClose, onSave }) {
         importance,
         status,
         description: description.trim(),
+        review_required: reviewRequired,
       };
 
       await onSave(updates);
@@ -202,6 +204,40 @@ export default function EditTaskModal({ task, onClose, onSave }) {
                 placeholder="Additional notes or academic details..."
               />
             </div>
+
+            {task.review_required && (
+              <div
+                className="review-edit-notice"
+                style={{
+                  marginTop: 14,
+                  padding: "10px 14px",
+                  background: "#fffbeb",
+                  border: "1px solid #fde68a",
+                  borderRadius: 6,
+                }}
+              >
+                <label
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 10,
+                    cursor: "pointer",
+                    fontSize: 13,
+                    fontWeight: 600,
+                    color: "#92400e",
+                  }}
+                >
+                  <input
+                    type="checkbox"
+                    checked={!reviewRequired}
+                    onChange={(e) => setReviewRequired(!e.target.checked)}
+                  />
+                  <span>
+                    ✓ Mark as human-reviewed &amp; verified (clears review warning)
+                  </span>
+                </label>
+              </div>
+            )}
 
             <div className="immutable-notice" style={{ marginTop: 14, padding: "10px 12px", background: "var(--bg-muted)", borderRadius: 6, fontSize: 12, color: "var(--text-dim)" }}>
               🔒 <strong>Cryptographic &amp; Provenance Protection:</strong> Original message text, sender (<code>{task.source_sender || "Unknown"}</code>), timestamp, and confidence (<code>{task.confidence || "UNASSESSED"}</code>) are immutable and cannot be altered.

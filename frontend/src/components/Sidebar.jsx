@@ -5,6 +5,8 @@ export default function Sidebar({
   candidatesCount = 0,
   opportunitiesCount = 0,
   materialsCount = 0,
+  unreadMessagesCount = 0,
+  unreadNotificationsCount = 0,
   user = null,
   googleAccount = null,
   onSyncGmail,
@@ -128,6 +130,138 @@ export default function Sidebar({
                     {candidatesCount}
                   </span>
                 )}
+              </button>
+            </li>
+          </ul>
+
+          <div className="nav-group-label" style={{ marginTop: "1rem" }}>COLLABORATION &amp; COMMUNITY</div>
+          <ul className="nav-list">
+            <li>
+              <button
+                type="button"
+                className={`sidebar-nav-item ${activeTab === "courses" ? "active" : ""}`}
+                onClick={() => {
+                  onSelectTab("courses");
+                  if (onClose) onClose();
+                }}
+                aria-current={activeTab === "courses" ? "page" : undefined}
+              >
+                <span className="nav-item-icon" aria-hidden="true">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" />
+                    <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z" />
+                  </svg>
+                </span>
+                <span className="nav-item-label">{isTeacher ? "Manage Courses" : "My Courses"}</span>
+              </button>
+            </li>
+
+            <li>
+              <button
+                type="button"
+                className={`sidebar-nav-item ${activeTab === "communication" ? "active" : ""}`}
+                onClick={() => {
+                  onSelectTab("communication");
+                  if (onClose) onClose();
+                }}
+                aria-current={activeTab === "communication" ? "page" : undefined}
+              >
+                <span className="nav-item-icon" aria-hidden="true">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z" />
+                  </svg>
+                </span>
+                <span className="nav-item-label">Live Chat</span>
+                {unreadMessagesCount > 0 && (
+                  <span className="sidebar-counter-badge sidebar-badge-highlight" title={`${unreadMessagesCount} unread messages`}>
+                    {unreadMessagesCount}
+                  </span>
+                )}
+              </button>
+            </li>
+
+            <li>
+              <button
+                type="button"
+                className={`sidebar-nav-item ${activeTab === "announcements" ? "active" : ""}`}
+                onClick={() => {
+                  onSelectTab("announcements");
+                  if (onClose) onClose();
+                }}
+                aria-current={activeTab === "announcements" ? "page" : undefined}
+              >
+                <span className="nav-item-icon" aria-hidden="true">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M22 17H2a3 3 0 0 0 3-3V9a7 7 0 0 1 14 0v5a3 3 0 0 0 3 3zm-8.27 4a2 2 0 0 1-3.46 0" />
+                  </svg>
+                </span>
+                <span className="nav-item-label">Announcements</span>
+              </button>
+            </li>
+
+            <li>
+              <button
+                type="button"
+                className={`sidebar-nav-item ${activeTab === "polls" ? "active" : ""}`}
+                onClick={() => {
+                  onSelectTab("polls");
+                  if (onClose) onClose();
+                }}
+                aria-current={activeTab === "polls" ? "page" : undefined}
+              >
+                <span className="nav-item-icon" aria-hidden="true">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <line x1="18" y1="20" x2="18" y2="10" />
+                    <line x1="12" y1="20" x2="12" y2="4" />
+                    <line x1="6" y1="20" x2="6" y2="14" />
+                  </svg>
+                </span>
+                <span className="nav-item-label">Interactive Polls</span>
+              </button>
+            </li>
+
+            <li>
+              <button
+                type="button"
+                className={`sidebar-nav-item ${activeTab === "notifications" ? "active" : ""}`}
+                onClick={() => {
+                  onSelectTab("notifications");
+                  if (onClose) onClose();
+                }}
+                aria-current={activeTab === "notifications" ? "page" : undefined}
+              >
+                <span className="nav-item-icon" aria-hidden="true">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9" />
+                    <path d="M13.73 21a2 2 0 0 1-3.46 0" />
+                  </svg>
+                </span>
+                <span className="nav-item-label">Notifications</span>
+                {unreadNotificationsCount > 0 && (
+                  <span className="sidebar-counter-badge sidebar-badge-opp" title={`${unreadNotificationsCount} unread notifications`}>
+                    {unreadNotificationsCount}
+                  </span>
+                )}
+              </button>
+            </li>
+
+            <li>
+              <button
+                type="button"
+                className={`sidebar-nav-item ${activeTab === "analytics" ? "active" : ""}`}
+                onClick={() => {
+                  onSelectTab("analytics");
+                  if (onClose) onClose();
+                }}
+                aria-current={activeTab === "analytics" ? "page" : undefined}
+              >
+                <span className="nav-item-icon" aria-hidden="true">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M3 3v18h18" />
+                    <path d="M18 9l-5 5-4-4-3 3" />
+                  </svg>
+                </span>
+                <span className="nav-item-label">{isTeacher ? "Class Analytics" : "My Analytics"}</span>
               </button>
             </li>
           </ul>

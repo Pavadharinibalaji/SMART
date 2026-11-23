@@ -4747,3 +4747,183 @@ button.kpi-card:hover, .kpi-card:hover {
   font-weight: 700;
   color: var(--text-primary);
 }
+
+/* ==============================================================================
+   Gmail Deep Links, Extracted Resource Chips & Review Workflow Actions
+   ============================================================================== */
+
+.btn-gmail-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px;
+  border-radius: 9999px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: #c5221f;
+  background: #fce8e6;
+  border: 1px solid #f6aea9;
+  text-decoration: none;
+  transition: all 0.15s ease;
+  user-select: none;
+}
+
+.btn-gmail-pill:hover {
+  background: #fad2cf;
+  border-color: #ee675c;
+  color: #a50e0e;
+  text-decoration: none;
+}
+
+.btn-url-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 9999px;
+  font-size: 0.75rem;
+  font-weight: 500;
+  color: #1e40af;
+  background: #eff6ff;
+  border: 1px solid #bfdbfe;
+  text-decoration: none;
+  transition: all 0.15s ease;
+  max-width: 280px;
+}
+
+.btn-url-pill:hover {
+  background: #dbeafe;
+  border-color: #93c5fd;
+  color: #1d4ed8;
+  text-decoration: none;
+}
+
+.btn-url-pill span:last-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.url-kind-tag {
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(30, 64, 175, 0.1);
+  flex-shrink: 0;
+}
+
+.btn-review-confirm {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 6px 12px;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  font-weight: 600;
+  border: 1px solid #d97706;
+  background: #fffbeb;
+  color: #b45309;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.btn-review-confirm:hover {
+  background: #fef3c7;
+  border-color: #b45309;
+  color: #92400e;
+}
+
+.saas-primary-btn-sm {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 12px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--primary);
+  background: var(--primary);
+  color: #ffffff;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.saas-primary-btn-sm:hover {
+  background: var(--primary-dark);
+  border-color: var(--primary-dark);
+}
+
+.gmail-evidence-box {
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  border-radius: var(--radius-md);
+  padding: 12px 14px;
+  margin-top: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.gmail-evidence-info {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.gmail-evidence-tag {
+  font-size: 11px;
+  font-weight: 700;
+  color: #991b1b;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.extracted-urls-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.extracted-url-chip {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-muted);
+  border: 1px solid var(--border);
+  text-decoration: none;
+  color: var(--text-main);
+  font-size: 13px;
+  font-weight: 500;
+  transition: all 0.15s ease;
+}
+
+.extracted-url-chip:hover {
+  background: #ffffff;
+  border-color: var(--primary);
+  color: var(--primary);
+}
+
+.url-kind-badge {
+  font-size: 11px;
+  font-weight: 700;
+  padding: 2px 7px;
+  border-radius: 4px;
+  margin-right: 8px;
+  flex-shrink: 0;
+}
+
+.kind-google_form { background: #f3e8ff; color: #7e22ce; }
+.kind-classroom { background: #ecfdf5; color: #047857; }
+.kind-drive { background: #eff6ff; color: #1d4ed8; }
+.kind-registration { background: #fef3c7; color: #b45309; }
+.kind-competition { background: #fff1f2; color: #be123c; }
+.kind-meeting { background: #e0f2fe; color: #0369a1; }
+.kind-reference, .kind-generic { background: #f1f5f9; color: #475569; }

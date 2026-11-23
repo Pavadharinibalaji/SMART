@@ -13,8 +13,10 @@ export default function DashboardOverview({
   onExportDeadlines,
   onSwitchToAnalyze,
   onUpdateTaskStatus,
+  onMarkReviewed,
   onOpenEvidence,
   onOpenEdit,
+  onTrackOpportunity,
   todayStr,
 }) {
   // Filter upcoming active tasks sorted chronologically by due date
@@ -437,7 +439,18 @@ export default function DashboardOverview({
                       )}
                     </div>
 
-                    <div className="review-row-action">
+                    <div className="review-row-action" style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      {onMarkReviewed && (
+                        <button
+                          type="button"
+                          className="saas-primary-btn-sm"
+                          onClick={() => onMarkReviewed(t.id, "pending")}
+                          title="Confirm and mark pending"
+                          aria-label={`Confirm and approve ${t.title}`}
+                        >
+                          ✓ Approve
+                        </button>
+                      )}
                       <button
                         type="button"
                         className="saas-outline-btn-sm"
@@ -559,10 +572,43 @@ export default function DashboardOverview({
                         <polyline points="8.21 13.89 7 23 12 20 17 23 15.79 13.88" />
                       </svg>
                     </div>
-                    <div className="mini-course-info">
+                    <div className="mini-course-info" style={{ flex: 1 }}>
                       <span className="mini-course-title">{opp.name}</span>
                       <span className="mini-course-sub">{opp.organizer || "University"} · Deadline: {opp.registration_deadline || "Open"}</span>
                     </div>
+                    {onTrackOpportunity && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          onTrackOpportunity({
+                            opportunity_id: opp.id,
+                            title: opp.name,
+                            organizer: opp.organizer,
+                            category: opp.category || "Competition",
+                            description: opp.description,
+                            registration_url: opp.registration_url,
+                            registration_deadline: opp.registration_deadline,
+                            event_date: opp.event_date,
+                            source_platform: opp.source_type || "gmail",
+                            source_reference: opp.evidence_text,
+                            isNewTracking: true,
+                          })
+                        }
+                        style={{
+                          background: "#ede9fe",
+                          color: "#5b21b6",
+                          border: "1px solid #c4b5fd",
+                          padding: "0.3rem 0.65rem",
+                          borderRadius: "6px",
+                          fontSize: "0.76rem",
+                          fontWeight: 700,
+                          cursor: "pointer",
+                          whiteSpace: "nowrap",
+                        }}
+                      >
+                        🎯 Track
+                      </button>
+                    )}
                   </div>
                 ))}
               </div>

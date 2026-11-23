@@ -1,10 +1,20 @@
+import { useState } from "react";
+import { gradeSubmission } from "../api";
+import OpportunitiesAnalytics from "./OpportunitiesAnalytics";
+
 export default function TeacherDashboard({
   coursesOverview = [],
   opportunitiesOverview = { status_counts: {}, participations: [] },
+  submissions = [],
   user = null,
   loading = false,
   onRefresh,
+  onSubmissionGraded,
+  onNavigateToTab,
 }) {
+  const [gradingState, setGradingState] = useState({}); // { [subId]: { grade: '', isSubmitting: false, error: null } }
+  const [feedbackMsg, setFeedbackMsg] = useState(null);
+
   const participations = opportunitiesOverview.participations || [];
   const statusCounts = opportunitiesOverview.status_counts || {};
 
@@ -12,6 +22,55 @@ export default function TeacherDashboard({
   const totalSubmissions = coursesOverview.reduce((acc, c) => acc + (c.total_submissions || 0), 0);
   const pendingTurnedIn = coursesOverview.reduce((acc, c) => acc + (c.turned_in_count || 0), 0);
   const totalGraded = coursesOverview.reduce((acc, c) => acc + (c.graded_count || 0), 0);
+
+  const handleGradeChange = (subId, val) => {
+    setGradingState((prev) => ({
+      ...prev,
+      [subId]: { ...prev[subId], grade: val, error: null },
+    }));
+  };
+
+  const handleSaveGrade = async (sub) => {
+    const entered = gradingState[sub.id]?.grade;
+    if (entered === undefined || entered === "" || isNaN(Number(entered))) {
+      setGradingState((prev) => ({
+        ...prev,
+        [sub.id]: { ...prev[sub.id], error: "Enter valid score" },
+      }));
+      return;
+    }
+
+    setGradingState((prev) => ({
+      ...prev,
+      [sub.id]: { ...prev[sub.id], isSubmitting: true, error: null },
+    }));
+    setFeedbackMsg(null);
+
+    try {
+      await gradeSubmission(sub.id, Number(entered));
+      setFeedbackMsg({
+        type: "success",
+        text: `Graded ${sub.student_name || sub.student_id}'s submission with ${entered}/${sub.max_points || 100} points.`,
+      });
+      if (onSubmissionGraded) {
+        onSubmissionGraded();
+      }
+    } catch (err) {
+      setGradingState((prev) => ({
+        ...prev,
+        [sub.id]: { ...prev[sub.id], error: err.message || "Failed" },
+      }));
+      setFeedbackMsg({
+        type: "error",
+        text: err.message || "Failed to record grade.",
+      });
+    } finally {
+      setGradingState((prev) => ({
+        ...prev,
+        [sub.id]: { ...prev[sub.id], isSubmitting: false },
+      }));
+    }
+  };
 
   return (
     <div className="teacher-dashboard-view" aria-label="Authorized Teacher Dashboard">
@@ -43,6 +102,33 @@ export default function TeacherDashboard({
           )}
         </div>
       </div>
+
+      {/* Feedback Alert */}
+      {feedbackMsg && (
+        <div
+          className={`saas-alert-banner ${feedbackMsg.type === "success" ? "alert-success" : "alert-error"}`}
+          style={{
+            padding: "12px 16px",
+            marginBottom: 20,
+            borderRadius: 8,
+            backgroundColor: feedbackMsg.type === "success" ? "rgba(16, 185, 129, 0.1)" : "rgba(239, 68, 68, 0.1)",
+            color: feedbackMsg.type === "success" ? "#065f46" : "#991b1b",
+            border: `1px solid ${feedbackMsg.type === "success" ? "#a7f3d0" : "#fecaca"}`,
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+          }}
+        >
+          <span>{feedbackMsg.text}</span>
+          <button
+            type="button"
+            onClick={() => setFeedbackMsg(null)}
+            style={{ background: "none", border: "none", cursor: "pointer", fontWeight: "bold" }}
+          >
+            ×
+          </button>
+        </div>
+      )}
 
       {/* Security & Access Restriction Callout Banner */}
       <div className="teacher-security-callout" role="note">
@@ -132,11 +218,21 @@ export default function TeacherDashboard({
 
       {/* Section 1: Courses I Teach & Submission Progress */}
       <div className="saas-card" style={{ marginBottom: 24, marginTop: 24 }}>
-        <div className="card-header-row">
+        <div className="card-header-row" style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
           <div>
             <h3 className="card-section-title">Courses I Teach &amp; Submission Progress</h3>
             <p className="card-section-desc">Course-level assignment completion and grading queue</p>
           </div>
+          {onNavigateToTab && (
+            <button
+              type="button"
+              className="saas-secondary-btn"
+              onClick={() => onNavigateToTab("courses")}
+              style={{ display: "flex", alignItems: "center", gap: "0.4rem", padding: "0.45rem 0.9rem", borderRadius: "6px", cursor: "pointer", fontWeight: 600 }}
+            >
+              <span>Manage Courses &amp; Rosters →</span>
+            </button>
+          )}
         </div>
 
         {coursesOverview.length === 0 ? (
@@ -179,6 +275,112 @@ export default function TeacherDashboard({
                 </div>
               </div>
             ))}
+          </div>
+        )}
+      </div>
+
+      {/* Section 1.5: Coursework Submissions Queue & Grading */}
+      <div className="saas-card" style={{ marginBottom: 24 }}>
+        <div className="card-header-row">
+          <div>
+            <h3 className="card-section-title">Submissions Queue &amp; Grading</h3>
+            <p className="card-section-desc">Review submitted student assignments and enter evaluation grades</p>
+          </div>
+        </div>
+
+        {submissions.length === 0 ? (
+          <div className="chart-empty-state">
+            <p>No student submissions found for your courses.</p>
+          </div>
+        ) : (
+          <div className="coursework-table-wrapper" style={{ marginTop: 16 }}>
+            <table className="saas-table">
+              <thead>
+                <tr>
+                  <th>Student</th>
+                  <th>Assignment / Course</th>
+                  <th>Status</th>
+                  <th>Current Grade</th>
+                  <th>Enter Grade</th>
+                  <th>Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                {submissions.map((sub) => {
+                  const maxPts = sub.max_points || 100;
+                  const currentInput = gradingState[sub.id]?.grade !== undefined
+                    ? gradingState[sub.id]?.grade
+                    : (sub.assigned_grade !== null && sub.assigned_grade !== undefined ? sub.assigned_grade : "");
+                  const isGrading = gradingState[sub.id]?.isSubmitting;
+                  const errText = gradingState[sub.id]?.error;
+
+                  return (
+                    <tr key={sub.id}>
+                      <td>
+                        <strong className="table-title">{sub.student_name || sub.student_id}</strong>
+                        <p className="table-desc">{sub.student_id}</p>
+                      </td>
+                      <td>
+                        <strong className="table-title">{sub.coursework_title || "Assignment"}</strong>
+                        <p className="table-desc">{sub.course_name} {sub.due_date ? `· Due ${sub.due_date}` : ""}</p>
+                      </td>
+                      <td>
+                        <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
+                          <span className={`status-badge-sub sub-state-${(sub.state || "new").toLowerCase()}`}>
+                            {sub.state === "TURNED_IN" ? "Turned In" : sub.state === "RETURNED" ? "Graded" : sub.state}
+                          </span>
+                          {sub.late === 1 && (
+                            <span className="demo-data-badge" style={{ backgroundColor: "#ef4444", color: "#fff" }}>
+                              Late
+                            </span>
+                          )}
+                        </div>
+                      </td>
+                      <td>
+                        <span className="grade-val">
+                          {sub.assigned_grade !== null && sub.assigned_grade !== undefined
+                            ? `${sub.assigned_grade} / ${maxPts}`
+                            : "—"}
+                        </span>
+                      </td>
+                      <td>
+                        <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                          <input
+                            type="number"
+                            min="0"
+                            max={maxPts}
+                            step="0.5"
+                            value={currentInput}
+                            onChange={(e) => handleGradeChange(sub.id, e.target.value)}
+                            placeholder={`0-${maxPts}`}
+                            style={{
+                              width: "80px",
+                              padding: "4px 8px",
+                              borderRadius: "4px",
+                              border: errText ? "1px solid #ef4444" : "1px solid #d1d5db",
+                              fontSize: "0.875rem",
+                            }}
+                          />
+                          <span style={{ fontSize: "0.75rem", color: "#6b7280" }}>/ {maxPts}</span>
+                        </div>
+                        {errText && <p style={{ color: "#ef4444", fontSize: "0.75rem", marginTop: "2px" }}>{errText}</p>}
+                      </td>
+                      <td>
+                        <button
+                          type="button"
+                          className="saas-primary-btn"
+                          style={{ padding: "6px 12px", fontSize: "0.8125rem", whiteSpace: "nowrap" }}
+                          onClick={() => handleSaveGrade(sub)}
+                          disabled={isGrading}
+                        >
+                          {isGrading ? "Saving..." : sub.assigned_grade !== null && sub.assigned_grade !== undefined ? "Update Grade" : "Grade & Return"}
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
           </div>
         )}
       </div>
@@ -256,6 +458,9 @@ export default function TeacherDashboard({
           </div>
         )}
       </div>
+
+      {/* Section 3: Course-Level Opportunities & Competitions Analytics (SMART 3.2) */}
+      <OpportunitiesAnalytics />
     </div>
   );
 }

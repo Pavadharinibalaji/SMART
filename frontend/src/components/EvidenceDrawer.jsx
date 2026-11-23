@@ -25,7 +25,7 @@ const CATEGORY_COLORS = {
  * - Accessible modal dialog with keyboard (Escape) and backdrop click dismissal.
  * - Reusable across both Analyze Chat candidates and saved Tasks dashboard.
  */
-export default function EvidenceDrawer({ item, onClose }) {
+export default function EvidenceDrawer({ item, onClose, onMarkReviewed, onTrackOpportunity }) {
   const closeBtnRef = useRef(null);
 
   // Keyboard accessibility: Dismiss drawer on Escape key
@@ -54,6 +54,15 @@ export default function EvidenceDrawer({ item, onClose }) {
   if (!item) {
     return null;
   }
+
+  const meta = typeof item.source_metadata === "string"
+    ? (() => { try { return JSON.parse(item.source_metadata); } catch { return {}; } })()
+    : (item.source_metadata || {});
+  const isGmail = item.source_type === "gmail" || Boolean(meta.gmail_deep_link) || Boolean(meta.threadId);
+  const gmailDeepLink = meta.gmail_deep_link || (meta.threadId ? `https://mail.google.com/mail/u/0/#all/${meta.threadId}` : null);
+  const extractedUrls = Array.isArray(meta.extracted_urls)
+    ? meta.extracted_urls
+    : (Array.isArray(item.urls) ? item.urls.map((u) => ({ url: u, label: u, kind: "generic" })) : []);
 
   const categoryStyle = CATEGORY_COLORS[item.category] || {
     bg: "#f1f5f9",
@@ -283,16 +292,132 @@ export default function EvidenceDrawer({ item, onClose }) {
                 <div>
                   <strong>Original source message is unavailable.</strong>
                   <p className="drawer-empty-subtext">
-                    No WhatsApp chat message was attached to this task.
+                    No original communication message was attached to this task.
                   </p>
                 </div>
               </div>
             )}
           </section>
+
+          {/* Section 6: Gmail Source Integration */}
+          {(isGmail || Boolean(gmailDeepLink)) && (
+            <section className="drawer-section" aria-labelledby="section-gmail-source">
+              <div className="drawer-section-header">
+                <h3 id="section-gmail-source" className="drawer-section-title">
+                  Gmail Source Integration
+                </h3>
+              </div>
+              <div className="gmail-evidence-box">
+                <div className="gmail-evidence-info">
+                  <span className="gmail-evidence-tag">✉️ Live Google Email</span>
+                  {meta.threadId && (
+                    <span style={{ fontSize: "12px", color: "var(--text-muted)" }}>
+                      <strong>Thread ID:</strong> <code>{meta.threadId}</code>
+                    </span>
+                  )}
+                  {item.source_id && (
+                    <span style={{ fontSize: "12px", color: "var(--text-muted)" }}>
+                      <strong>Message ID:</strong> <code>{item.source_id}</code>
+                    </span>
+                  )}
+                </div>
+                {gmailDeepLink && (
+                  <a
+                    href={gmailDeepLink}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="btn-gmail-pill"
+                    style={{ fontSize: "13px", padding: "8px 14px" }}
+                  >
+                    <span>✉️</span> View Original Email ↗
+                  </a>
+                )}
+              </div>
+            </section>
+          )}
+
+          {/* Section 7: Shared Links & Resources */}
+          {extractedUrls.length > 0 && (
+            <section className="drawer-section" aria-labelledby="section-extracted-urls">
+              <div className="drawer-section-header">
+                <h3 id="section-extracted-urls" className="drawer-section-title">
+                  Shared Links &amp; Resources ({extractedUrls.length})
+                </h3>
+              </div>
+              <div className="extracted-urls-grid">
+                {extractedUrls.map((u, idx) => (
+                  <a
+                    key={idx}
+                    href={u.url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="extracted-url-chip"
+                    title={u.url}
+                  >
+                    <div style={{ display: "flex", alignItems: "center", gap: "8px", minWidth: 0 }}>
+                      <span className={`url-kind-badge kind-${u.kind || "generic"}`}>
+                        {u.kind === "google_form"
+                          ? "📝 Google Form"
+                          : u.kind === "classroom"
+                          ? "🏫 Google Classroom"
+                          : u.kind === "drive"
+                          ? "📁 Google Drive"
+                          : u.kind === "registration"
+                          ? "📋 Registration"
+                          : u.kind === "competition"
+                          ? "🏆 Competition"
+                          : u.kind === "meeting"
+                          ? "📹 Video Meet"
+                          : "🔗 Resource"}
+                      </span>
+                      <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        {u.label || u.url}
+                      </span>
+                    </div>
+                    <span style={{ marginLeft: "12px", color: "var(--primary)", fontWeight: 700 }}>↗</span>
+                  </a>
+                ))}
+              </div>
+            </section>
+          )}
         </div>
 
         {/* Drawer Footer */}
         <footer className="drawer-footer">
+          {onTrackOpportunity && (
+            <button
+              type="button"
+              className="btn btn-secondary"
+              style={{ color: "#4f46e5", borderColor: "#c7d2fe", background: "#ede9fe", fontWeight: 600 }}
+              onClick={() => {
+                onTrackOpportunity({
+                  title: item.title,
+                  description: item.description,
+                  registration_deadline: item.due_date,
+                  category: item.category === "Opportunity" ? "Competition" : "Other",
+                  source_platform: item.source_type || "whatsapp",
+                  source_reference: item.evidence_text || item.title,
+                  registration_url: item.parsed_shared_urls?.[0]?.url || null,
+                  isNewTracking: true,
+                });
+                onClose();
+              }}
+            >
+              🎯 Track Opportunity
+            </button>
+          )}
+          {item.review_required && onMarkReviewed && (
+            <button
+              type="button"
+              className="btn btn-primary"
+              onClick={async () => {
+                await onMarkReviewed(item.id, "pending");
+                onClose();
+              }}
+            >
+              ✓ Approve &amp; Mark Pending
+            </button>
+          )}
           <button
             type="button"
             className="btn btn-secondary"
