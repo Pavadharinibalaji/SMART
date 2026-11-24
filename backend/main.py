@@ -1330,12 +1330,13 @@ class DemoToggleRequest(BaseModel):
 def get_google_auth_url(
     role: str = Query("student", description="Requested demonstration role ('student' or 'teacher')"),
     redirect_uri: Optional[str] = Query(None, description="Custom OAuth redirect URI"),
+    prompt: Optional[str] = Query(None, description="Google OAuth prompt mode ('consent', 'select_account', etc.)"),
 ) -> dict[str, Any]:
     """Generate a CSRF-protected Google OAuth 2.0 authorization URL."""
     clean_role = (role or "student").strip().lower()
     if clean_role not in ("student", "teacher"):
         clean_role = "student"
-    return build_authorization_url(role=clean_role, redirect_uri=redirect_uri)
+    return build_authorization_url(role=clean_role, redirect_uri=redirect_uri, prompt=prompt)
 
 
 @app.get("/api/auth/google/callback")

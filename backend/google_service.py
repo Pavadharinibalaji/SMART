@@ -12,8 +12,9 @@ Implements:
 from __future__ import annotations
 
 import config  # Ensures root .env is loaded before accessing environment variables
+import asyncio
 import base64
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import os
 import re
@@ -79,9 +80,39 @@ def is_live_google_configured() -> bool:
     return bool(cid and sec)
 
 
+_refresh_locks: dict[str, asyncio.Lock] = {}
+
+
+def _get_refresh_lock(email: str) -> asyncio.Lock:
+    """Retrieve or create an asyncio.Lock for a specific user email."""
+    clean_email = (email or "default").strip().lower()
+    if clean_email not in _refresh_locks:
+        _refresh_locks[clean_email] = asyncio.Lock()
+    return _refresh_locks[clean_email]
+
+
+def is_token_expired(expiry_iso: Optional[str], buffer_seconds: int = 300) -> bool:
+    """Check if token is expired or expiring within buffer_seconds (default 5 minutes).
+
+    Returns True if expiry_iso is missing, malformed, or within buffer_seconds of expiry.
+    """
+    if not expiry_iso:
+        return True
+    try:
+        clean_iso = expiry_iso.replace("Z", "+00:00")
+        expiry_dt = datetime.fromisoformat(clean_iso)
+        if expiry_dt.tzinfo is None:
+            expiry_dt = expiry_dt.replace(tzinfo=timezone.utc)
+        now_utc = datetime.now(timezone.utc)
+        return (expiry_dt - now_utc).total_seconds() <= buffer_seconds
+    except Exception:
+        return True
+
+
 def build_authorization_url(
     role: str = "student",
     redirect_uri: Optional[str] = None,
+    prompt: Optional[str] = None,
 ) -> dict[str, Any]:
     """Generate the Google OAuth 2.0 authorization URL with CSRF state token."""
     client_id, _ = get_oauth_credentials()
@@ -100,6 +131,7 @@ def build_authorization_url(
             "message": "Google Client ID is not configured in environment (GOOGLE_CLIENT_ID). Live OAuth requires client credentials.",
         }
 
+    selected_prompt = prompt or "consent"
     state = generate_oauth_state(role=role, redirect_uri=clean_redirect)
     params = {
         "client_id": client_id,
@@ -107,7 +139,7 @@ def build_authorization_url(
         "response_type": "code",
         "scope": " ".join(READONLY_SCOPES),
         "access_type": "offline",
-        "prompt": "consent",
+        "prompt": selected_prompt,
         "state": state,
     }
     url = f"{GOOGLE_AUTH_ENDPOINT}?{urllib.parse.urlencode(params)}"
@@ -155,8 +187,12 @@ async def exchange_code_for_tokens(code: str, state: str) -> dict[str, Any]:
         tokens = token_resp.json()
         access_token = tokens.get("access_token")
         refresh_token = tokens.get("refresh_token")
-        expires_in = tokens.get("expires_in", 3600)
-        expiry_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            expires_in = int(tokens.get("expires_in", 3600))
+        except (ValueError, TypeError):
+            expires_in = 3600
+        expiry_dt = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+        expiry_iso = expiry_dt.isoformat()
 
         # User Info
         user_resp = await client.get(
@@ -177,12 +213,16 @@ async def exchange_code_for_tokens(code: str, state: str) -> dict[str, Any]:
                 "is absent. Persistent live OAuth storage is disabled to prevent unencrypted or ephemeral storage."
             )
 
+        # Preserve existing encrypted refresh token if Google did not send a new one on re-consent
+        existing_account = get_google_account(email=email)
+        existing_enc_refresh = existing_account.get("encrypted_refresh_token") if existing_account else None
+
         account_record = {
             "email": email,
             "name": profile.get("name", email.split("@")[0]),
             "picture": profile.get("picture"),
             "encrypted_access_token": encrypt_token(access_token),
-            "encrypted_refresh_token": encrypt_token(refresh_token) if refresh_token else None,
+            "encrypted_refresh_token": encrypt_token(refresh_token) if refresh_token else existing_enc_refresh,
             "token_expiry": expiry_iso,
             "scopes": tokens.get("scope", " ".join(READONLY_SCOPES)),
             "role": role,
@@ -192,25 +232,81 @@ async def exchange_code_for_tokens(code: str, state: str) -> dict[str, Any]:
         return saved
 
 
-async def get_valid_access_token(account: dict[str, Any]) -> str:
-    """Decrypt access token or refresh it if expired."""
+async def get_valid_access_token(
+    account: dict[str, Any],
+    force_refresh: bool = False,
+) -> str:
+    """Retrieve a valid Google OAuth access token, automatically refreshing if expired or expiring soon.
+
+    Args:
+        account: Connected Google account dictionary from database.
+        force_refresh: If True, forces a refresh against Google's token endpoint.
+
+    Returns:
+        A valid decrypted plaintext access token.
+
+    Raises:
+        ValueError: If tokens are missing, expired without refresh token, or revoked.
+    """
     enc_access = account.get("encrypted_access_token")
     enc_refresh = account.get("encrypted_refresh_token")
+    token_expiry = account.get("token_expiry")
+    email = (account.get("email") or "").strip().lower()
+
+    if account.get("is_demo"):
+        if enc_access:
+            try:
+                return decrypt_token(enc_access)
+            except Exception:
+                pass
+        return "demo_access_token"
 
     if not enc_access and not enc_refresh:
-        raise ValueError("No OAuth tokens stored for this account.")
+        raise ValueError("No OAuth tokens stored for this account. Please connect your Google account.")
 
-    # Try existing decrypted access token
-    if enc_access:
+    # 1. Fast-path: Reuse existing decrypted access token if valid and not expiring soon
+    if not force_refresh and enc_access and not is_token_expired(token_expiry, buffer_seconds=300):
         try:
-            return decrypt_token(enc_access)
+            cached_token = decrypt_token(enc_access)
+            if cached_token:
+                return cached_token
         except Exception:
-            pass
+            pass  # Corrupted access token; fall through to refresh
 
-    # Attempt refresh
-    if enc_refresh:
-        raw_refresh = decrypt_token(enc_refresh)
+    # 2. Check refresh token availability
+    if not enc_refresh:
+        raise ValueError(
+            "Google account requires reconnection: refresh token is missing. Please reconnect your Google account in Settings."
+        )
+
+    # 3. Synchronize concurrent refresh requests for the same account email
+    lock = _get_refresh_lock(email)
+    async with lock:
+        # Double-check inside lock: another concurrent task might have already refreshed
+        latest_account = get_google_account(email=email) if email else None
+        if not latest_account:
+            latest_account = account
+
+        if not force_refresh and latest_account.get("encrypted_access_token"):
+            if not is_token_expired(latest_account.get("token_expiry"), buffer_seconds=300):
+                try:
+                    rechecked_token = decrypt_token(latest_account["encrypted_access_token"])
+                    if rechecked_token:
+                        account.update(latest_account)
+                        return rechecked_token
+                except Exception:
+                    pass
+
+        active_enc_refresh = latest_account.get("encrypted_refresh_token") or enc_refresh
+        try:
+            raw_refresh = decrypt_token(active_enc_refresh)
+        except Exception as err:
+            raise ValueError(f"Failed to decrypt stored refresh token: {err}. Please reconnect your Google account.")
+
         client_id, client_secret = get_oauth_credentials()
+        if not client_id or not client_secret:
+            raise ValueError("Google OAuth credentials are not configured on the server.")
+
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.post(
                 GOOGLE_TOKEN_ENDPOINT,
@@ -221,14 +317,56 @@ async def get_valid_access_token(account: dict[str, Any]) -> str:
                     "grant_type": "refresh_token",
                 },
             )
+
             if resp.status_code == 200:
                 data = resp.json()
                 new_access = data.get("access_token")
-                account["encrypted_access_token"] = encrypt_token(new_access)
-                save_google_account(account)
+                if not new_access:
+                    raise ValueError("Google OAuth token refresh did not return an access token.")
+
+                try:
+                    expires_in = int(data.get("expires_in", 3600))
+                except (ValueError, TypeError):
+                    expires_in = 3600
+
+                new_expiry_dt = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+                new_expiry_iso = new_expiry_dt.isoformat()
+
+                latest_account["encrypted_access_token"] = encrypt_token(new_access)
+                latest_account["token_expiry"] = new_expiry_iso
+
+                # Update rotated refresh token if Google sent a new one
+                new_refresh = data.get("refresh_token")
+                if new_refresh:
+                    latest_account["encrypted_refresh_token"] = encrypt_token(new_refresh)
+
+                saved = save_google_account(latest_account)
+                if saved:
+                    account.update(saved)
+                else:
+                    account.update(latest_account)
                 return new_access
 
-    raise ValueError("Token is expired and could not be refreshed. Please reconnect your Google account.")
+            # Parse error payload
+            err_data = {}
+            try:
+                err_data = resp.json()
+            except Exception:
+                pass
+
+            err_code = err_data.get("error", "")
+            err_desc = err_data.get("error_description", "")
+
+            if (
+                err_code in ("invalid_grant", "unauthorized_client")
+                or "revoked" in err_desc.lower()
+                or "expired" in err_desc.lower()
+            ):
+                raise ValueError(
+                    "Google authorization has expired or was revoked. Please reconnect your Google account in Settings."
+                )
+
+            raise ValueError(f"Google token refresh failed ({resp.status_code}): {err_desc or resp.text}")
 
 
 def extract_urls_with_labels(text: str, html: Optional[str] = None) -> list[dict[str, str]]:
@@ -446,8 +584,22 @@ async def sync_live_gmail(account: dict[str, Any], max_messages: int = 15) -> di
             headers=headers,
             params={"q": query, "maxResults": max_messages},
         )
+        if list_resp.status_code == 401:
+            # Token might have expired mid-session or been revoked; force refresh and retry once
+            token = await get_valid_access_token(account, force_refresh=True)
+            headers["Authorization"] = f"Bearer {token}"
+            list_resp = await client.get(
+                GMAIL_MESSAGES_ENDPOINT,
+                headers=headers,
+                params={"q": query, "maxResults": max_messages},
+            )
+
         if list_resp.status_code == 403:
             raise PermissionError("Gmail API access was denied by Google or your Google Workspace administrator.")
+        if list_resp.status_code == 401:
+            raise ValueError(
+                "Google authorization has expired or credentials are invalid. Please reconnect your Google account in Settings."
+            )
         if list_resp.status_code != 200:
             raise ValueError(f"Gmail message search failed ({list_resp.status_code}): {list_resp.text}")
 
@@ -465,6 +617,10 @@ async def sync_live_gmail(account: dict[str, Any], max_messages: int = 15) -> di
         for it in msg_items:
             mid = it.get("id")
             detail_resp = await client.get(f"{GMAIL_MESSAGES_ENDPOINT}/{mid}", headers=headers)
+            if detail_resp.status_code == 401:
+                token = await get_valid_access_token(account, force_refresh=True)
+                headers["Authorization"] = f"Bearer {token}"
+                detail_resp = await client.get(f"{GMAIL_MESSAGES_ENDPOINT}/{mid}", headers=headers)
             if detail_resp.status_code == 200:
                 raw_msg = detail_resp.json()
                 raw_emails.append(raw_msg)
@@ -677,8 +833,20 @@ async def sync_live_classroom(account: dict[str, Any]) -> dict[str, Any]:
             headers=headers,
             params={"courseStates": "ACTIVE"},
         )
+        if courses_resp.status_code == 401:
+            token = await get_valid_access_token(account, force_refresh=True)
+            headers["Authorization"] = f"Bearer {token}"
+            courses_resp = await client.get(
+                CLASSROOM_COURSES_ENDPOINT,
+                headers=headers,
+                params={"courseStates": "ACTIVE"},
+            )
         if courses_resp.status_code == 403:
             raise PermissionError("Google Classroom API access was denied by Google or your Google Workspace administrator.")
+        if courses_resp.status_code == 401:
+            raise ValueError(
+                "Google authorization has expired or credentials are invalid. Please reconnect your Google account in Settings."
+            )
         if courses_resp.status_code != 200:
             raise ValueError(f"Failed to fetch Classroom courses ({courses_resp.status_code}): {courses_resp.text}")
 

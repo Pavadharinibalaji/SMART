@@ -839,3 +839,303 @@ def test_dismissed_gmail_item_deduplication_protection():
     assert dup is not None
     assert dup["id"] == saved["id"]
     assert dup["status"] == "dismissed"
+
+
+# ==============================================================================
+# Google OAuth Token Expiration, Refresh & Persistence Regression Tests
+# ==============================================================================
+
+@pytest.mark.anyio
+async def test_valid_access_token_is_reused_without_external_refresh():
+    """Verify that a valid access token whose expiry is in the future is reused without refreshing."""
+    from unittest.mock import AsyncMock, patch
+    from datetime import datetime, timedelta, timezone
+
+    email = "active.student@univ.edu"
+    future_expiry = (datetime.now(timezone.utc) + timedelta(minutes=45)).isoformat()
+    raw_access = "valid_cached_access_token_123"
+    raw_refresh = "valid_stored_refresh_token_456"
+
+    account = {
+        "email": email,
+        "name": "Active Student",
+        "encrypted_access_token": security.encrypt_token(raw_access),
+        "encrypted_refresh_token": security.encrypt_token(raw_refresh),
+        "token_expiry": future_expiry,
+        "scopes": "openid https://www.googleapis.com/auth/gmail.readonly",
+        "role": "student",
+        "is_demo": 0,
+    }
+    database.save_google_account(account)
+
+    post_mock = AsyncMock()
+    with patch("httpx.AsyncClient.post", post_mock):
+        token = await google_service.get_valid_access_token(account)
+        assert token == raw_access
+        assert post_mock.call_count == 0
+
+
+@pytest.mark.anyio
+async def test_expired_access_token_is_refreshed_and_persisted():
+    """Verify that an expired access token is refreshed via Google's token endpoint and persisted to DB."""
+    import httpx
+    from unittest.mock import AsyncMock, patch
+    from datetime import datetime, timedelta, timezone
+
+    email = "expired.student@univ.edu"
+    past_expiry = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    old_access = "expired_access_token_old"
+    raw_refresh = "valid_refresh_token_to_renew"
+
+    account = {
+        "email": email,
+        "name": "Expired Student",
+        "encrypted_access_token": security.encrypt_token(old_access),
+        "encrypted_refresh_token": security.encrypt_token(raw_refresh),
+        "token_expiry": past_expiry,
+        "scopes": "openid https://www.googleapis.com/auth/gmail.readonly",
+        "role": "student",
+        "is_demo": 0,
+    }
+    database.save_google_account(account)
+
+    new_access = "ya29.refreshed_access_token_new"
+    rotated_refresh = "1//04new_rotated_refresh_token_abc"
+
+    mock_resp = httpx.Response(
+        200,
+        json={
+            "access_token": new_access,
+            "expires_in": 3600,
+            "refresh_token": rotated_refresh,
+            "token_type": "Bearer",
+        },
+    )
+
+    with patch("httpx.AsyncClient.post", AsyncMock(return_value=mock_resp)) as post_mock:
+        with patch.dict(os.environ, {"GOOGLE_CLIENT_ID": "mock_cid", "GOOGLE_CLIENT_SECRET": "mock_sec"}):
+            token = await google_service.get_valid_access_token(account)
+            assert token == new_access
+            assert post_mock.call_count == 1
+
+            # Verify token persistence in database
+            db_account = database.get_google_account(email=email)
+            assert db_account is not None
+            assert security.decrypt_token(db_account["encrypted_access_token"]) == new_access
+            assert security.decrypt_token(db_account["encrypted_refresh_token"]) == rotated_refresh
+
+            # Verify updated expiry is now in the future
+            clean_iso = db_account["token_expiry"].replace("Z", "+00:00")
+            expiry_dt = datetime.fromisoformat(clean_iso)
+            if expiry_dt.tzinfo is None:
+                expiry_dt = expiry_dt.replace(tzinfo=timezone.utc)
+            assert expiry_dt > datetime.now(timezone.utc)
+
+
+@pytest.mark.anyio
+async def test_missing_refresh_token_produces_clear_reconnect_error():
+    """Verify that an expired token without a refresh token produces a clear reconnection message."""
+    from datetime import datetime, timedelta, timezone
+
+    email = "no_refresh.student@univ.edu"
+    past_expiry = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+
+    account = {
+        "email": email,
+        "name": "No Refresh Student",
+        "encrypted_access_token": security.encrypt_token("expired_access_token"),
+        "encrypted_refresh_token": None,
+        "token_expiry": past_expiry,
+        "role": "student",
+        "is_demo": 0,
+    }
+    database.save_google_account(account)
+
+    with pytest.raises(ValueError) as exc_info:
+        await google_service.get_valid_access_token(account)
+
+    err_text = str(exc_info.value)
+    assert "reconnect" in err_text.lower()
+    assert "refresh token is missing" in err_text.lower()
+
+
+@pytest.mark.anyio
+async def test_revoked_refresh_token_handled_correctly():
+    """Verify that an invalid_grant / revoked refresh token raises a clear reconnection message."""
+    import httpx
+    from unittest.mock import AsyncMock, patch
+    from datetime import datetime, timedelta, timezone
+
+    email = "revoked.student@univ.edu"
+    past_expiry = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+
+    account = {
+        "email": email,
+        "name": "Revoked Student",
+        "encrypted_access_token": security.encrypt_token("old_token"),
+        "encrypted_refresh_token": security.encrypt_token("revoked_refresh_token"),
+        "token_expiry": past_expiry,
+        "role": "student",
+        "is_demo": 0,
+    }
+    database.save_google_account(account)
+
+    mock_error_resp = httpx.Response(
+        400,
+        json={
+            "error": "invalid_grant",
+            "error_description": "Token has been expired or revoked.",
+        },
+    )
+
+    with patch("httpx.AsyncClient.post", AsyncMock(return_value=mock_error_resp)):
+        with patch.dict(os.environ, {"GOOGLE_CLIENT_ID": "mock_cid", "GOOGLE_CLIENT_SECRET": "mock_sec"}):
+            with pytest.raises(ValueError) as exc_info:
+                await google_service.get_valid_access_token(account)
+
+            err_text = str(exc_info.value)
+            assert "reconnect" in err_text.lower()
+            assert "expired or was revoked" in err_text.lower()
+
+
+@pytest.mark.anyio
+async def test_gmail_search_uses_refreshed_access_token():
+    """Verify that Gmail search automatically refreshes expired access token and retries on 401."""
+    import httpx
+    from unittest.mock import AsyncMock, patch
+    from datetime import datetime, timedelta, timezone
+
+    email = "gmail.sync@univ.edu"
+    past_expiry = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+
+    account = {
+        "email": email,
+        "name": "Gmail Sync User",
+        "encrypted_access_token": security.encrypt_token("old_expired_gmail_token"),
+        "encrypted_refresh_token": security.encrypt_token("refresh_for_gmail"),
+        "token_expiry": past_expiry,
+        "scopes": "openid https://www.googleapis.com/auth/gmail.readonly",
+        "role": "student",
+        "is_demo": 0,
+    }
+    database.save_google_account(account)
+
+    refreshed_token = "ya29.refreshed_gmail_live_token"
+
+    mock_token_resp = httpx.Response(
+        200,
+        json={"access_token": refreshed_token, "expires_in": 3600},
+    )
+    mock_gmail_list_resp = httpx.Response(
+        200,
+        json={"messages": []},
+    )
+
+    recorded_headers = []
+
+    async def mock_get(url, *args, **kwargs):
+        headers = kwargs.get("headers", {})
+        recorded_headers.append(headers.get("Authorization"))
+        return mock_gmail_list_resp
+
+    with patch("httpx.AsyncClient.post", AsyncMock(return_value=mock_token_resp)):
+        with patch("httpx.AsyncClient.get", AsyncMock(side_effect=mock_get)):
+            with patch.dict(os.environ, {"GOOGLE_CLIENT_ID": "mock_cid", "GOOGLE_CLIENT_SECRET": "mock_sec"}):
+                result = await google_service.sync_live_gmail(account)
+                assert result["synced_count"] == 0
+                # Verify that the Gmail API request received the refreshed token, not the old expired token
+                assert recorded_headers == [f"Bearer {refreshed_token}"]
+
+
+@pytest.mark.anyio
+async def test_google_classroom_sync_preserves_functionality_with_refresh():
+    """Verify Google Classroom sync correctly refreshes token and retrieves active courses."""
+    import httpx
+    from unittest.mock import AsyncMock, patch
+    from datetime import datetime, timedelta, timezone
+
+    email = "classroom.sync@univ.edu"
+    past_expiry = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+
+    account = {
+        "email": email,
+        "name": "Classroom Sync User",
+        "encrypted_access_token": security.encrypt_token("old_classroom_token"),
+        "encrypted_refresh_token": security.encrypt_token("refresh_for_classroom"),
+        "token_expiry": past_expiry,
+        "scopes": "openid https://www.googleapis.com/auth/classroom.courses.readonly",
+        "role": "student",
+        "is_demo": 0,
+    }
+    database.save_google_account(account)
+
+    refreshed_token = "ya29.refreshed_classroom_live_token"
+
+    mock_token_resp = httpx.Response(
+        200,
+        json={"access_token": refreshed_token, "expires_in": 3600},
+    )
+    mock_courses_resp = httpx.Response(
+        200,
+        json={"courses": []},
+    )
+
+    recorded_headers = []
+
+    async def mock_get(url, *args, **kwargs):
+        headers = kwargs.get("headers", {})
+        recorded_headers.append(headers.get("Authorization"))
+        return mock_courses_resp
+
+    with patch("httpx.AsyncClient.post", AsyncMock(return_value=mock_token_resp)):
+        with patch("httpx.AsyncClient.get", AsyncMock(side_effect=mock_get)):
+            with patch.dict(os.environ, {"GOOGLE_CLIENT_ID": "mock_cid", "GOOGLE_CLIENT_SECRET": "mock_sec"}):
+                result = await google_service.sync_live_classroom(account)
+                assert result["courses_count"] == 0
+                assert recorded_headers == [f"Bearer {refreshed_token}"]
+
+
+@pytest.mark.anyio
+async def test_concurrent_refresh_requests_are_synchronized():
+    """Verify concurrent requests for same user share one refresh call without duplicate tokens."""
+    import asyncio
+    import httpx
+    from unittest.mock import AsyncMock, patch
+    from datetime import datetime, timedelta, timezone
+
+    email = "concurrent.student@univ.edu"
+    past_expiry = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+
+    account = {
+        "email": email,
+        "name": "Concurrent User",
+        "encrypted_access_token": security.encrypt_token("expired_concurrent_token"),
+        "encrypted_refresh_token": security.encrypt_token("refresh_concurrent"),
+        "token_expiry": past_expiry,
+        "role": "student",
+        "is_demo": 0,
+    }
+    database.save_google_account(account)
+
+    call_count = 0
+
+    async def mock_post_refresh(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        await asyncio.sleep(0.05)  # Simulate network latency
+        return httpx.Response(
+            200,
+            json={"access_token": "ya29.synchronized_concurrent_token", "expires_in": 3600},
+        )
+
+    with patch("httpx.AsyncClient.post", AsyncMock(side_effect=mock_post_refresh)):
+        with patch.dict(os.environ, {"GOOGLE_CLIENT_ID": "mock_cid", "GOOGLE_CLIENT_SECRET": "mock_sec"}):
+            # Launch two concurrent calls for the same user
+            t1 = google_service.get_valid_access_token(dict(account))
+            t2 = google_service.get_valid_access_token(dict(account))
+            r1, r2 = await asyncio.gather(t1, t2)
+
+            assert r1 == "ya29.synchronized_concurrent_token"
+            assert r2 == "ya29.synchronized_concurrent_token"
+            # Exactly one HTTP post to Google token endpoint occurred
+            assert call_count == 1
