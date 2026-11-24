@@ -463,3 +463,85 @@ def test_google_oauth_callback_rejects_unauthorized_public_email(client, monkeyp
 
     # 3. Verify user was NOT provisioned in database
     assert get_user_by_email(unauthorized_email) is None
+
+
+# ------------------------------------------------------------------------------
+# 8. Vercel Production CORS Regression Tests
+# ------------------------------------------------------------------------------
+
+def test_cors_options_preflight_vercel_origin(client, monkeypatch):
+    """OPTIONS preflight from the exact Vercel production origin returns 200 with required CORS headers."""
+    vercel_origin = "https://smart-academic-lake.vercel.app"
+    headers = {
+        "Origin": vercel_origin,
+        "Access-Control-Request-Method": "GET",
+        "Access-Control-Request-Headers": "Content-Type, Authorization, X-User-Email",
+    }
+    resp = client.options("/api/opportunities", headers=headers)
+    assert resp.status_code == 200
+    assert resp.headers.get("access-control-allow-origin") == vercel_origin
+    assert resp.headers.get("access-control-allow-credentials") == "true"
+    allowed_methods = resp.headers.get("access-control-allow-methods", "")
+    for method in ["GET", "POST", "OPTIONS"]:
+        assert method in allowed_methods
+
+
+def test_cors_get_request_vercel_origin(client):
+    """GET request to /api/opportunities from Vercel origin returns 200 with CORS headers."""
+    vercel_origin = "https://smart-academic-lake.vercel.app"
+    resp = client.get("/api/opportunities", headers={"Origin": vercel_origin})
+    assert resp.status_code == 200
+    assert resp.headers.get("access-control-allow-origin") == vercel_origin
+    assert resp.headers.get("access-control-allow-credentials") == "true"
+    assert isinstance(resp.json(), list)
+
+
+def test_cors_authenticated_request_with_credentials(client, monkeypatch):
+    """Authenticated request with session cookie from Vercel origin returns 200 and CORS headers."""
+    from database import provision_user, create_user_session
+    from security import generate_session_id, generate_csrf_token
+    from datetime import datetime, timezone, timedelta
+
+    vercel_origin = "https://smart-academic-lake.vercel.app"
+    user = provision_user(
+        email="cors.student@citchennai.net",
+        name="CORS Student",
+        role="student",
+    )
+    session_id = generate_session_id()
+    csrf_token = generate_csrf_token()
+    expires_dt = datetime.now(timezone.utc) + timedelta(hours=24)
+    create_user_session(
+        user_id=user["id"],
+        session_id=session_id,
+        csrf_token=csrf_token,
+        expires_at_iso=expires_dt.isoformat(),
+    )
+
+    resp = client.get(
+        "/api/auth/me",
+        headers={"Origin": vercel_origin},
+        cookies={"smart_session": session_id},
+    )
+    assert resp.status_code == 200
+    assert resp.headers.get("access-control-allow-origin") == vercel_origin
+    assert resp.headers.get("access-control-allow-credentials") == "true"
+    data = resp.json()
+    assert data["authenticated"] is True
+    assert data["user"]["email"] == "cors.student@citchennai.net"
+
+
+def test_cors_rejected_unknown_origin(client):
+    """Request from an unauthorized origin does not receive Access-Control-Allow-Origin header."""
+    attacker_origin = "https://unauthorized-attacker.com"
+    resp = client.get("/api/opportunities", headers={"Origin": attacker_origin})
+    assert resp.headers.get("access-control-allow-origin") is None
+
+
+def test_cors_headers_on_error_response(client):
+    """404 and error responses still return Access-Control-Allow-Origin to prevent browser masking as CORS error."""
+    vercel_origin = "https://smart-academic-lake.vercel.app"
+    resp = client.get("/api/non-existent-endpoint", headers={"Origin": vercel_origin})
+    assert resp.status_code == 404
+    assert resp.headers.get("access-control-allow-origin") == vercel_origin
+    assert resp.headers.get("access-control-allow-credentials") == "true"

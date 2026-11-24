@@ -33,6 +33,7 @@ DEFAULT_DEV_ORIGINS = [
     "http://127.0.0.1:3000",
     "http://localhost:4173",
     "http://127.0.0.1:4173",
+    "https://smart-academic-lake.vercel.app",
 ]
 
 
@@ -72,7 +73,8 @@ def get_cors_origins() -> list[str]:
     In development, includes default localhost origins for seamless local dev.
     In production:
     - Prohibits wildcards '*'.
-    - Requires non-empty CORS_ORIGINS.
+    - Normalizes origins (stripping whitespace, quotes, and trailing slashes).
+    - Requires non-empty CORS_ORIGINS or SMART_FRONTEND_URL.
     - Requires at least one valid HTTPS origin.
     - Does not silently substitute localhost defaults.
     """
@@ -82,11 +84,20 @@ def get_cors_origins() -> list[str]:
     configured: list[str] = []
     if raw_env:
         for part in raw_env.split(","):
-            origin = part.strip()
+            origin = part.strip().strip("'\" \t\r\n")
             if origin:
                 if origin == "*":
                     raise ValueError("Security violation: Wildcard '*' origin is prohibited with credentials enabled.")
-                configured.append(origin.rstrip("/"))
+                clean = origin.rstrip("/")
+                if not clean.startswith("http://") and not clean.startswith("https://"):
+                    clean = f"https://{clean}"
+                configured.append(clean)
+
+    # Incorporate SMART_FRONTEND_URL if set
+    custom_fe = os.environ.get("SMART_FRONTEND_URL", "").strip().strip("'\" \t\r\n").rstrip("/")
+    if custom_fe:
+        if custom_fe.startswith("https://") or (not prod and custom_fe.startswith("http://")):
+            configured.append(custom_fe)
 
     if prod:
         if not configured:

@@ -2464,9 +2464,10 @@ def list_opportunities(
             FROM opportunities o
             LEFT JOIN student_opportunity_statuses s
               ON o.id = s.opportunity_id
-              AND (s.student_id = ? OR ? IS NULL)
         """
-        params.extend([student_id, student_id])
+        if student_id:
+            base_sql += " AND s.student_id = ?"
+            params.append(student_id)
 
         if where_clauses:
             base_sql += " WHERE " + " AND ".join(where_clauses)

@@ -31,17 +31,17 @@ console.log("Running getApiBaseUrl & WebSocket URL unit tests...");
 
 // Test 1: Production with valid HTTPS URL
 {
-  const env = { PROD: true, VITE_API_URL: "https://smart-backend.onrender.com" };
+  const env = { PROD: true, VITE_API_URL: "https://smart-0t9t.onrender.com" };
   const url = resolveApiBaseUrl(env);
-  assert.equal(url, "https://smart-backend.onrender.com");
+  assert.equal(url, "https://smart-0t9t.onrender.com");
   console.log("[PASS] 1. Production with valid HTTPS URL resolves correctly");
 }
 
 // Test 2: Production with trailing slashes and whitespace
 {
-  const env = { PROD: true, VITE_API_URL: "  https://smart-backend.onrender.com///  " };
+  const env = { PROD: true, VITE_API_URL: "  https://smart-0t9t.onrender.com///  " };
   const url = resolveApiBaseUrl(env);
-  assert.equal(url, "https://smart-backend.onrender.com");
+  assert.equal(url, "https://smart-0t9t.onrender.com");
   console.log("[PASS] 2. Trailing slashes and whitespace are properly trimmed");
 }
 
@@ -84,9 +84,9 @@ console.log("Running getApiBaseUrl & WebSocket URL unit tests...");
 
 // Test 7: WebSocket URL conversion from HTTPS to WSS
 {
-  const apiUrl = "https://smart-backend.onrender.com";
+  const apiUrl = "https://smart-0t9t.onrender.com";
   const wsUrl = resolveWsUrl(apiUrl, 42);
-  assert.equal(wsUrl, "wss://smart-backend.onrender.com/ws/courses/42/messages");
+  assert.equal(wsUrl, "wss://smart-0t9t.onrender.com/ws/courses/42/messages");
   console.log("[PASS] 7. WebSocket URL converts HTTPS to WSS properly");
 }
 
