@@ -38,7 +38,15 @@ DEFAULT_DEV_ORIGINS = [
 
 def is_production() -> bool:
     """Check if the environment is configured as production."""
-    return os.environ.get("SMART_ENV", "development").strip().lower() == "production"
+    smart_env = os.environ.get("SMART_ENV", "").strip().lower()
+    if smart_env == "production":
+        return True
+    if smart_env == "development":
+        return False
+    # Auto-detect common cloud production hosts (Render, Vercel, Railway, Fly)
+    if any(os.environ.get(k) for k in ("RENDER", "RENDER_SERVICE_ID", "VERCEL", "FLY_ALLOC_ID")):
+        return True
+    return False
 
 
 def is_env_var_configured(name: str) -> bool:
@@ -114,12 +122,60 @@ def get_frontend_url() -> str:
     return "http://localhost:5173"
 
 
+DEFAULT_INSTITUTIONAL_DOMAINS = [
+    "citchennai.net",
+    "university.edu",
+    "univ.edu",
+]
+
+
+def is_institutional_email(email: str) -> bool:
+    """Validate whether an email address satisfies the institutional registration policy.
+
+    Checks against:
+    1. ALLOWED_EMAIL_DOMAINS or INSTITUTIONAL_EMAIL_DOMAINS environment variable (comma-separated).
+    2. Default institutional domains ('citchennai.net', 'university.edu', 'univ.edu').
+    3. Standard educational Top-Level Domains ('.edu', '.ac.in', '.edu.in').
+
+    Rejects public/consumer mail domains ('gmail.com', 'yahoo.com', etc.) to prevent
+    unrestricted public account creation.
+    """
+    clean = email.strip().lower()
+    if "@" not in clean:
+        return False
+    domain = clean.split("@", 1)[1]
+
+    # Explicitly configured domains
+    configured_raw = os.environ.get("ALLOWED_EMAIL_DOMAINS") or os.environ.get("INSTITUTIONAL_EMAIL_DOMAINS", "")
+    if configured_raw.strip():
+        allowed = [d.strip().lower() for d in configured_raw.split(",") if d.strip()]
+        for allowed_domain in allowed:
+            if allowed_domain.startswith("."):
+                if domain.endswith(allowed_domain):
+                    return True
+            elif domain == allowed_domain:
+                return True
+        return False
+
+    # Default institutional domain check
+    for inst_domain in DEFAULT_INSTITUTIONAL_DOMAINS:
+        if domain == inst_domain or domain.endswith("." + inst_domain):
+            return True
+
+    # Standard academic/educational TLDs
+    if domain.endswith(".edu") or domain.endswith(".ac.in") or domain.endswith(".edu.in"):
+        return True
+
+    return False
+
+
 def get_cookie_settings() -> dict[str, Any]:
     """Retrieve secure session cookie configuration.
     
     Configurable via:
     - COOKIE_SAMESITE: 'none', 'lax', or 'strict' (default: 'none' in production, 'lax' in development)
     - COOKIE_SECURE: boolean (default: True in production or when SameSite=None, False in local development)
+    - COOKIE_PARTITIONED: boolean (default: False; enable only for embedded iframe contexts)
     """
     prod = is_production()
 
@@ -141,12 +197,18 @@ def get_cookie_settings() -> dict[str, Any]:
     if samesite == "none" and not secure:
         secure = True
 
-    return {
+    partitioned_raw = os.environ.get("COOKIE_PARTITIONED", "").strip().lower()
+    partitioned = partitioned_raw in ("1", "true", "yes")
+
+    settings: dict[str, Any] = {
         "samesite": samesite,
         "secure": secure,
         "httponly": True,
         "path": "/",
     }
+    if partitioned:
+        settings["partitioned"] = True
+    return settings
 
 
 def is_demo_login_allowed() -> bool:

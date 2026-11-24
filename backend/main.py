@@ -13,6 +13,7 @@ from config import (
     get_cors_origins,
     get_frontend_url,
     is_demo_login_allowed,
+    is_institutional_email,
     is_production,
     validate_production_config,
 )
@@ -1042,15 +1043,22 @@ IS_PRODUCTION = SMART_ENV == "production"
 def apply_session_cookie(response: Response, session_id: str) -> None:
     """Set authenticated session cookie with environment-appropriate security attributes."""
     cfg = get_cookie_settings()
-    response.set_cookie(
-        key=SESSION_COOKIE_NAME,
-        value=session_id,
-        httponly=cfg["httponly"],
-        samesite=cfg["samesite"],
-        secure=cfg["secure"],
-        max_age=SESSION_DURATION_HOURS * 3600,
-        path=cfg["path"],
-    )
+    cookie_kwargs: dict[str, Any] = {
+        "key": SESSION_COOKIE_NAME,
+        "value": session_id,
+        "httponly": cfg["httponly"],
+        "samesite": cfg["samesite"],
+        "secure": cfg["secure"],
+        "max_age": SESSION_DURATION_HOURS * 3600,
+        "path": cfg["path"],
+    }
+    if cfg.get("partitioned"):
+        cookie_kwargs["partitioned"] = True
+    try:
+        response.set_cookie(**cookie_kwargs)
+    except TypeError:
+        cookie_kwargs.pop("partitioned", None)
+        response.set_cookie(**cookie_kwargs)
 
 
 def clear_session_cookie(response: Response) -> None:
@@ -1348,24 +1356,53 @@ async def handle_google_oauth_callback(
         redirect_res = RedirectResponse(url=f"{frontend_base}/?google_auth_success=1&email={urllib.parse.quote(account.get('email', ''))}")
         # Synchronize Google profile name/picture to provisioned SMART user if available
         if account.get("email"):
-            prov_user = get_user_by_email(account["email"])
-            if prov_user:
+            clean_email = account["email"].strip().lower()
+            prov_user = get_user_by_email(clean_email)
+            if not prov_user:
+                if not is_institutional_email(clean_email):
+                    err_msg = (
+                        f"Access denied: '{clean_email}' is not an authorized institutional account. "
+                        "Please sign in with your official university Google Workspace account or contact your administrator."
+                    )
+                    if raw:
+                        raise HTTPException(status_code=403, detail=err_msg)
+                    return RedirectResponse(
+                        url=f"{frontend_base}/?google_auth_error={urllib.parse.quote(err_msg)}"
+                    )
+
+                req_role = (account.get("role") or "student").strip().lower()
+                if req_role not in ("student", "teacher"):
+                    req_role = "student"
+                prov_user = provision_user(
+                    email=clean_email,
+                    name=account.get("name") or clean_email.split("@")[0].capitalize(),
+                    role=req_role,
+                    status="active",
+                    is_demo=0,
+                )
+            else:
                 update_user_profile(
                     user_id=prov_user["id"],
                     name=account.get("name") or prov_user.get("name"),
                     picture=account.get("picture") or prov_user.get("picture"),
                 )
-                if prov_user.get("status") == "active":
-                    session_id = generate_session_id()
-                    csrf_token = generate_csrf_token()
-                    expires_dt = datetime.now(timezone.utc) + timedelta(hours=SESSION_DURATION_HOURS)
-                    create_user_session(
-                        user_id=prov_user["id"],
-                        session_id=session_id,
-                        csrf_token=csrf_token,
-                        expires_at_iso=expires_dt.isoformat(),
-                    )
-                    apply_session_cookie(redirect_res, session_id)
+
+            if prov_user.get("status") == "active":
+                session_id = generate_session_id()
+                csrf_token = generate_csrf_token()
+                expires_dt = datetime.now(timezone.utc) + timedelta(hours=SESSION_DURATION_HOURS)
+                create_user_session(
+                    user_id=prov_user["id"],
+                    session_id=session_id,
+                    csrf_token=csrf_token,
+                    expires_at_iso=expires_dt.isoformat(),
+                )
+                apply_session_cookie(redirect_res, session_id)
+            else:
+                err_msg = "Account is suspended or deactivated. Contact your institution administrator."
+                if raw:
+                    raise HTTPException(status_code=403, detail=err_msg)
+                return RedirectResponse(url=f"{frontend_base}/?google_auth_error={urllib.parse.quote(err_msg)}")
         if raw:
             return {
                 "status": "connected",

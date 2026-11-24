@@ -352,3 +352,114 @@ def test_google_oauth_callback_redirects_to_production_frontend(client, monkeypa
     assert res_miss.status_code == 307
     location_miss = res_miss.headers.get("location", "")
     assert location_miss.startswith("https://smart-academic-lake.vercel.app/?google_auth_error=")
+
+
+def test_google_oauth_callback_provisions_user_and_restores_session(client, monkeypatch):
+    """Successful Google OAuth callback provisions unseeded user, sets session cookie, and restores session via /api/auth/me."""
+    from unittest.mock import AsyncMock
+    import main
+
+    monkeypatch.setenv("SMART_ENV", "production")
+    monkeypatch.setenv("CORS_ORIGINS", "https://smart-academic-lake.vercel.app")
+    monkeypatch.delenv("SMART_FRONTEND_URL", raising=False)
+
+    test_email = "new.google.user@academic.edu"
+    mock_account = {
+        "email": test_email,
+        "name": "New Google Scholar",
+        "picture": "https://lh3.googleusercontent.com/photo.jpg",
+        "role": "student",
+        "is_demo": 0,
+    }
+
+    monkeypatch.setattr(main, "exchange_code_for_tokens", AsyncMock(return_value=mock_account))
+
+    # 1. Trigger OAuth callback
+    resp = client.get("/api/auth/google/callback?code=mock_code&state=mock_state", follow_redirects=False)
+    assert resp.status_code == 307
+    location = resp.headers.get("location", "")
+    assert location.startswith("https://smart-academic-lake.vercel.app/?google_auth_success=1")
+    assert "new.google.user%40academic.edu" in location
+
+    # Verify session cookie was set
+    cookie_header = resp.headers.get("set-cookie", "")
+    assert "smart_session=" in cookie_header
+    assert "samesite=none" in cookie_header.lower()
+    assert "secure" in cookie_header.lower()
+    assert "httponly" in cookie_header.lower()
+
+    # 2. Extract cookie and verify session restoration at /api/auth/me
+    session_val = resp.cookies.get("smart_session")
+    assert session_val is not None
+
+    me_resp = client.get("/api/auth/me", cookies={"smart_session": session_val})
+    assert me_resp.status_code == 200
+    me_data = me_resp.json()
+    assert me_data["authenticated"] is True
+    assert me_data["user"]["email"] == test_email
+    assert me_data["user"]["name"] == "New Google Scholar"
+    assert me_data["user"]["role"] == "student"
+
+
+def test_is_institutional_email_policy(monkeypatch):
+    """Institutional access policy permits educational/institution domains and blocks public domains."""
+    from config import is_institutional_email
+
+    # Standard institutional domains pass
+    assert is_institutional_email("student@citchennai.net") is True
+    assert is_institutional_email("prof.ann@citchennai.net") is True
+    assert is_institutional_email("alex.morgan@university.edu") is True
+    assert is_institutional_email("student.demo@univ.edu") is True
+    assert is_institutional_email("researcher@mit.edu") is True
+    assert is_institutional_email("scholar@iitd.ac.in") is True
+    assert is_institutional_email("learner@sub.citchennai.net") is True
+
+    # Public/consumer mail domains fail
+    assert is_institutional_email("spammer@gmail.com") is False
+    assert is_institutional_email("intruder@yahoo.com") is False
+    assert is_institutional_email("user@hotmail.com") is False
+    assert is_institutional_email("attacker@random.org") is False
+    assert is_institutional_email("invalid-email") is False
+
+    # Explicit environment domain override
+    monkeypatch.setenv("ALLOWED_EMAIL_DOMAINS", "custom-college.ac.uk, .partner.org")
+    assert is_institutional_email("student@custom-college.ac.uk") is True
+    assert is_institutional_email("collaborator@lab.partner.org") is True
+    assert is_institutional_email("intruder@gmail.com") is False
+
+
+def test_google_oauth_callback_rejects_unauthorized_public_email(client, monkeypatch):
+    """OAuth callback rejects unprovisioned public Google accounts to prevent unrestricted public account creation."""
+    from unittest.mock import AsyncMock
+    import main
+    from database import get_user_by_email
+
+    monkeypatch.setenv("SMART_ENV", "production")
+    monkeypatch.setenv("CORS_ORIGINS", "https://smart-academic-lake.vercel.app")
+    monkeypatch.delenv("SMART_FRONTEND_URL", raising=False)
+
+    unauthorized_email = "random.public.user@gmail.com"
+    mock_account = {
+        "email": unauthorized_email,
+        "name": "Random Public User",
+        "picture": "https://lh3.googleusercontent.com/photo.jpg",
+        "role": "student",
+        "is_demo": 0,
+    }
+
+    monkeypatch.setattr(main, "exchange_code_for_tokens", AsyncMock(return_value=mock_account))
+
+    # 1. Callback redirect response
+    resp = client.get("/api/auth/google/callback?code=mock_code&state=mock_state", follow_redirects=False)
+    assert resp.status_code == 307
+    location = resp.headers.get("location", "")
+    assert location.startswith("https://smart-academic-lake.vercel.app/?google_auth_error=")
+    import urllib.parse
+    decoded_loc = urllib.parse.unquote(location)
+    assert "not an authorized institutional account" in decoded_loc
+
+    # 2. Verify no session cookie was set
+    assert "smart_session" not in resp.cookies
+
+    # 3. Verify user was NOT provisioned in database
+    assert get_user_by_email(unauthorized_email) is None

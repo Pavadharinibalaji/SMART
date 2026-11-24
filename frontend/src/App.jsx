@@ -248,26 +248,52 @@ export default function App() {
     }
   }, [currentEmail, userRole]);
 
-  // Check existing session on mount
+  // Authoritative session verification & post-OAuth restoration on mount
   useEffect(() => {
     async function checkAuth() {
+      const params = new URLSearchParams(window.location.search);
+      const authSuccess = params.get("google_auth_success");
+      const authError = params.get("google_auth_error");
+
+      // Clean up OAuth query parameters from URL bar without reloading
+      if (authSuccess || authError) {
+        window.history.replaceState({}, document.title, window.location.pathname);
+      }
+
+      if (authError) {
+        setGoogleError(decodeURIComponent(authError));
+        setCurrentUser(null);
+        setAuthState("unauthenticated");
+        return;
+      }
+
       setAuthState("checking");
       try {
         const user = await getCurrentUser();
-        if (user) {
+        if (user && user.email) {
           setCurrentUser(user);
           setAuthState("authenticated");
+          if (authSuccess) {
+            setSuccess("Google Account successfully connected!");
+            loadGoogleStatus();
+          }
         } else {
           setCurrentUser(null);
           setAuthState("unauthenticated");
+          if (authSuccess) {
+            setGoogleError("Authenticated session could not be established. Please try signing in again.");
+          }
         }
-      } catch {
+      } catch (err) {
         setCurrentUser(null);
         setAuthState("unauthenticated");
+        if (authSuccess) {
+          setGoogleError(err.message || "Failed to verify session after Google login.");
+        }
       }
     }
     checkAuth();
-  }, []);
+  }, [loadGoogleStatus]);
 
   // Login handler with authoritative verification via /api/auth/me
   const handleLogin = async (email, idToken = null) => {
@@ -335,31 +361,6 @@ export default function App() {
     return () => clearInterval(interval);
   }, [currentUser, authState, refreshCounters, loadSavedTasks, loadGoogleStatus, loadOpportunities, loadClassroomData, loadMaterials, loadTeacherOverview, userRole]);
 
-  // Check post-OAuth redirect query params on mount
-  useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    const authSuccess = params.get("google_auth_success");
-    const authError = params.get("google_auth_error");
-
-    if (authSuccess) {
-      setSuccess("Google Account successfully connected!");
-      getCurrentUser()
-        .then((user) => {
-          if (user && user.email) {
-            setCurrentUser(user);
-            setUserRole(user.role || "student");
-            setAuthState("authenticated");
-          }
-        })
-        .catch(() => {});
-      loadGoogleStatus();
-      // Clean up query string from browser URL bar without reloading
-      window.history.replaceState({}, document.title, window.location.pathname);
-    } else if (authError) {
-      setGoogleError(decodeURIComponent(authError));
-      window.history.replaceState({}, document.title, window.location.pathname);
-    }
-  }, [loadGoogleStatus]);
 
   // Handlers for SMART 2.1
   const handleConnectGoogle = async () => {
@@ -899,7 +900,7 @@ export default function App() {
   }
 
   if (authState !== "authenticated" || !currentUser) {
-    return <LoginPage onLoginSuccess={handleLogin} />;
+    return <LoginPage onLoginSuccess={handleLogin} initialError={googleError} />;
   }
 
   return (

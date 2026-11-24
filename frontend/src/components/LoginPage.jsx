@@ -1,11 +1,17 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { getGoogleAuthUrl } from "../api";
 
-export default function LoginPage({ onLoginSuccess }) {
+export default function LoginPage({ onLoginSuccess, initialError = "" }) {
   const [email, setEmail] = useState("");
   const [idToken, setIdToken] = useState("");
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState("");
+  const [error, setError] = useState(initialError || "");
+
+  useEffect(() => {
+    if (initialError) {
+      setError(initialError);
+    }
+  }, [initialError]);
 
   const handleSignIn = async (targetEmail, targetToken = null) => {
     const loginEmail = targetEmail || email;
